@@ -1,0 +1,9 @@
+[package]
+name = "elide"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "A verified, AI-assisted video editor that removes dead air and disfluencies"
+
+[dependencies]
+
