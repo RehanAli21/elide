@@ -1,10 +1,13 @@
+use std::path::PathBuf;
 use std::process::Command;
+use std::{fs, path::Path};
 
 mod cli;
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use cli::Cli;
+use hound::WavReader;
 use serde::Deserialize;
 
 #[derive(Deserialize, Debug)]
@@ -39,11 +42,11 @@ fn ffprobe_json(input: &str) -> Result<String> {
         ])
         .arg(input)
         .output()
-        .context("coulff not run ffprobe. Is fffmpeg installed and on PATH?")?;
+        .context("could not run ffprobe. Is fffmpeg installed and on PATH?")?;
 
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
-        bail!("ffffprobe failed on {input}: {}", stderr.trim());
+        bail!("ffprobe failed on {input}: {}", stderr.trim());
     }
 
     String::from_utf8(out.stdout).context("ffprobe returned invalid UTF-8")
@@ -57,6 +60,32 @@ fn parse_fps(s: &str) -> Option<f64> {
         return None;
     }
     Some(num / den)
+}
+
+fn extract_audio(input: &str, wav_path: &Path) -> Result<()> {
+    let out = Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-i",
+            input,
+            "-vn",
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            "-c:a",
+            "pcm_s16le",
+        ])
+        .arg(wav_path)
+        .output()
+        .context("could not run ffmpeg. Is it installed and on PATH?")?;
+
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        bail!("ffmpeg failed to extract audio: {}", stderr.trim());
+    }
+
+    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -104,5 +133,27 @@ fn main() -> Result<()> {
         None => println!("audio       none"),
     }
 
+    let temp_dir = PathBuf::from(&args.output).join("temp");
+    fs::create_dir_all(&temp_dir)
+        .with_context(|| format!("could not create {}", temp_dir.display()))?;
+
+    let wav_path = temp_dir.join("a16.wav");
+
+    let audio = extract_audio(&args.input, &wav_path);
+
+    let reader = WavReader::open(&wav_path)
+        .with_context(|| format!("could not open {}", wav_path.display()))?;
+
+    let spec = reader.spec();
+    let samples: Vec<f32> = reader
+        .into_samples::<i16>()
+        .map(|s| s.map(|v| v as f32 / 32768.0))
+        .collect::<Result<Vec<f32>, _>>()?;
+
+    let secs = samples.len() as f64 / spec.sample_rate as f64;
+
+    println!("samples     {}", samples.len());
+    println!("rate        {} Hz", spec.sample_rate);
+    println!("duration    {secs:.2} s");
     Ok(())
 }
