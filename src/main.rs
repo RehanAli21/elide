@@ -251,6 +251,34 @@ fn pad(speech: &[bool], before_s: f64, after_s: f64) -> Vec<bool> {
     out
 }
 
+fn longest_silences(speech: &[bool], n: usize) -> Vec<(usize, usize)> {
+    let mut runs = Vec::new();
+    let mut i = 0;
+
+    while i < speech.len() {
+        if speech[i] {
+            i += 1;
+            continue;
+        }
+
+        let start = i;
+        while i < speech.len() && !speech[i] {
+            i += 1;
+        }
+        runs.push((start, i));
+    }
+
+    runs.sort_by_key(|&(start, end)| std::cmp::Reverse(end - start));
+    runs.truncate(n);
+    runs
+}
+
+fn fmt_time(t: f64) -> String {
+    let mins = (t / 60.0).floor();
+    let secs = t - mins * 60.0;
+    format!("{mins:02.0}:{secs:04.1}")
+}
+
 fn main() -> Result<()> {
     let args = Cli::parse();
 
@@ -420,6 +448,27 @@ fn main() -> Result<()> {
     let padded = pad(&dropped_mask, 0.50, 0.55);
     let pct = 100.0 * padded.iter().filter(|&&b| b).count() as f64 / padded.len() as f64;
     println!("padded      {pct:.1}%");
+
+    let slice = (580.0 / 0.02) as usize; // 29000
+    println!("580s slice  {}", padded[slice]);
+    println!("chunk       {}", chunk_speech[18125]);
+    for j in (29000 - 100)..(29000 + 100) {
+        if padded[j] != padded[j.saturating_sub(1)] {
+            println!("  edge at {:.2}s -> {}", j as f64 * 0.02, padded[j]);
+        }
+    }
+    println!("\nlongest silences:");
+    for (rank, &(start, end)) in longest_silences(&padded, 10).iter().enumerate() {
+        let t0 = start as f64 * 0.02;
+        let t1 = end as f64 * 0.02;
+        println!(
+            "{:3}  {} - {}   {:.1} s",
+            rank + 1,
+            fmt_time(t0),
+            fmt_time(t1),
+            t1 - t0
+        );
+    }
 
     Ok(())
 }
