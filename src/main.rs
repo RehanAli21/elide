@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::process::Command;
+use std::time::Instant;
 use std::{fs, path::Path};
 
 mod cli;
@@ -9,6 +10,7 @@ use clap::Parser;
 use cli::Cli;
 use hound::WavReader;
 use serde::{Deserialize, Serialize};
+use voice_activity_detector::{IteratorExt, VoiceActivityDetector};
 
 #[derive(Deserialize, Debug)]
 struct Probe {
@@ -140,6 +142,25 @@ fn extract_audio(input: &str, wav_path: &Path, gain_db: f64) -> Result<()> {
     Ok(())
 }
 
+fn hysteresis(probs: &[f32], enter: f32, exit: f32) -> Vec<bool> {
+    let mut out = Vec::with_capacity(probs.len());
+    let mut speaking = false;
+
+    for &p in probs {
+        if speaking {
+            if p < exit {
+                speaking = false;
+            }
+        } else if p >= enter {
+            speaking = true;
+        }
+
+        out.push(speaking);
+    }
+
+    out
+}
+
 fn main() -> Result<()> {
     let args = Cli::parse();
 
@@ -234,6 +255,67 @@ fn main() -> Result<()> {
     let path = temp_dir.join("analysis.json");
     fs::write(&path, serde_json::to_string_pretty(&analysis)?)
         .with_context(|| format!("could not write {}", path.display()))?;
+
+    let mut vad = VoiceActivityDetector::builder()
+        .sample_rate(16000)
+        .chunk_size(512usize)
+        .build()
+        .context("could not build VAD")?;
+
+    let t0 = Instant::now();
+    let probs: Vec<f32> = samples
+        .iter()
+        .copied()
+        .predict(&mut vad)
+        .map(|(_check, p)| p)
+        .collect();
+
+    let elapsed = t0.elapsed();
+
+    println!("vad         {:.1} s", elapsed.as_secs_f64());
+    println!("chunk 1875  {:.4}  (60.0 s, expect high)", probs[1875]);
+    println!("chunk 18125 {:.4}  (580.0 s, expect low)", probs[18125]);
+
+    let total = probs.len();
+    let above = probs.iter().filter(|&&p| p >= 0.30).count();
+    let below = probs.iter().filter(|&&p| p < 0.15).count();
+    let dead = total - above - below;
+
+    println!("chunks      {total}");
+    println!("  >= 0.30   {above}");
+    println!("  0.15-0.30 {dead}");
+    println!("  <  0.15   {below}");
+
+    let chunk_speech = hysteresis(&probs, 0.30, 0.15);
+
+    let naive: Vec<bool> = probs.iter().map(|&p| p >= 0.30).collect();
+
+    let transitions = |m: &[bool]| m.windows(2).filter(|w| w[0] != w[1]).count();
+
+    println!(
+        "hyst speech {:.1}%",
+        100.0 * chunk_speech.iter().filter(|&&b| b).count() as f64 / chunk_speech.len() as f64
+    );
+    println!(
+        "transitions naive {} -> hyst {}",
+        transitions(&naive),
+        transitions(&chunk_speech)
+    );
+
+    let mut speech = vec![false; grid_len];
+
+    for i in 0..grid_len {
+        let mid_sample = i * 320 + 160;
+        let chunk = mid_sample / 512;
+
+        if chunk < chunk_speech.len() {
+            speech[i] = chunk_speech[chunk];
+        }
+    }
+
+    let grid_speech_pct = 100.0 * speech.iter().filter(|&&b| b).count() as f64 / grid_len as f64;
+    println!("grid_len    {grid_len}");
+    println!("grid speech {grid_speech_pct:.1}%");
 
     Ok(())
 }
