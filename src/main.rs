@@ -161,6 +161,96 @@ fn hysteresis(probs: &[f32], enter: f32, exit: f32) -> Vec<bool> {
     out
 }
 
+fn bridge(speech: &[bool], max_gap_s: f64) -> Vec<bool> {
+    let mut out = speech.to_vec();
+    let mut i = 0;
+
+    while i < speech.len() {
+        if speech[i] {
+            i += 1;
+            continue;
+        }
+
+        let start = i;
+        while i < speech.len() && !speech[i] {
+            i += 1;
+        }
+        let end = i;
+
+        let has_speech_before = start > 0;
+        let has_speech_after = end < speech.len();
+        let len_s = (end - start) as f64 * 0.02;
+
+        if has_speech_before && has_speech_after && len_s < max_gap_s {
+            for j in start..end {
+                out[j] = true;
+            }
+        }
+    }
+
+    out
+}
+
+fn drop_bursts(speech: &[bool], min_speech_s: f64) -> (Vec<bool>, usize) {
+    let mut out = speech.to_vec();
+    let mut dropped = 0;
+    let mut i = 0;
+
+    while i < speech.len() {
+        if !speech[i] {
+            i += 1;
+            continue;
+        }
+
+        let start = i;
+        while i < speech.len() && speech[i] {
+            i += 1;
+        }
+        let end = i;
+
+        let len_s = (end - start) as f64 * 0.02;
+
+        if len_s < min_speech_s {
+            for j in start..end {
+                out[j] = false;
+            }
+            dropped += 1;
+        }
+    }
+
+    (out, dropped)
+}
+
+fn pad(speech: &[bool], before_s: f64, after_s: f64) -> Vec<bool> {
+    let before = (before_s / 0.02) as usize;
+    let after = (after_s / 0.02) as usize;
+
+    let mut out = speech.to_vec();
+    let mut i = 0;
+
+    while i < speech.len() {
+        if !speech[i] {
+            i += 1;
+            continue;
+        }
+
+        let start = i;
+        while i < speech.len() && speech[i] {
+            i += 1;
+        }
+        let end = i;
+
+        let from = start.saturating_sub(before);
+        let to = (end + after).min(speech.len());
+
+        for j in from..to {
+            out[j] = true;
+        }
+    }
+
+    out
+}
+
 fn main() -> Result<()> {
     let args = Cli::parse();
 
@@ -316,6 +406,20 @@ fn main() -> Result<()> {
     let grid_speech_pct = 100.0 * speech.iter().filter(|&&b| b).count() as f64 / grid_len as f64;
     println!("grid_len    {grid_len}");
     println!("grid speech {grid_speech_pct:.1}%");
+
+    let bridged = bridge(&speech, 0.35);
+    let pct = 100.0 * bridged.iter().filter(|&&b| b).count() as f64 / bridged.len() as f64;
+    println!("bridged     {pct:.1}%");
+
+    let (dropped_mask, n_dropped) = drop_bursts(&bridged, 0.25);
+
+    let pct =
+        100.0 * dropped_mask.iter().filter(|&&b| b).count() as f64 / dropped_mask.len() as f64;
+    println!("dropped     {pct:.1}%  ({n_dropped} bursts)");
+
+    let padded = pad(&dropped_mask, 0.50, 0.55);
+    let pct = 100.0 * padded.iter().filter(|&&b| b).count() as f64 / padded.len() as f64;
+    println!("padded      {pct:.1}%");
 
     Ok(())
 }
