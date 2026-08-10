@@ -142,6 +142,31 @@ fn extract_audio(input: &str, wav_path: &Path, gain_db: f64) -> Result<()> {
     Ok(())
 }
 
+fn sample_frames(input: &str, duration: f64) -> Result<Vec<Vec<u8>>> {
+    let fps = 200.0 / duration;
+    let filter = format!("fps={fps},scale=160:90,format=gray");
+
+    let out = Command::new("ffmpeg")
+        .args([
+            "-i", input, "-vf", &filter, "-an", "-f", "rawvideo", "-pix_fmt", "gray", "-",
+        ])
+        .output()
+        .context("could not run ffmpeg. Is it installed and on PATH?")?;
+
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        bail!("ffmpeg failed to sample frames: {}", stderr.trim());
+    }
+
+    let frames: Vec<Vec<u8>> = out
+        .stdout
+        .chunks_exact(160 * 90)
+        .map(|c| c.to_vec())
+        .collect();
+
+    Ok(frames)
+}
+
 fn hysteresis(probs: &[f32], enter: f32, exit: f32) -> Vec<bool> {
     let mut out = Vec::with_capacity(probs.len());
     let mut speaking = false;
@@ -279,17 +304,168 @@ fn fmt_time(t: f64) -> String {
     format!("{mins:02.0}:{secs:04.1}")
 }
 
+fn cell_activity(frames: &[Vec<u8>]) -> Vec<f32> {
+    let cells = 160 * 90;
+    let mut sums = vec![0.0f32; cells];
+
+    for pair in frames.windows(2) {
+        for c in 0..cells {
+            let diff = (pair[1][c] as i16 - pair[0][c] as i16).abs();
+            sums[c] += diff as f32;
+        }
+    }
+
+    let n = (frames.len() - 1) as f32;
+    sums.iter().map(|s| s / n).collect()
+}
+fn content_mask(activity: &[f32]) -> Option<(Vec<bool>, f32)> {
+    let max = activity.iter().fold(0.0f32, |m, &a| m.max(a));
+
+    if max < 2.0 {
+        return None;
+    }
+
+    let threshold = 0.08 * max;
+    let mask = activity.iter().map(|&a| a > threshold).collect();
+    Some((mask, threshold))
+}
+
+fn blobs(mask: &[bool], w: usize, h: usize) -> Vec<Vec<usize>> {
+    let mut seen = vec![false; mask.len()];
+    let mut out = Vec::new();
+
+    for start in 0..mask.len() {
+        if !mask[start] || seen[start] {
+            continue;
+        }
+
+        let mut blob = Vec::new();
+        let mut stack = vec![start];
+        seen[start] = true;
+
+        while let Some(c) = stack.pop() {
+            blob.push(c);
+            let (x, y) = (c % w, c / w);
+
+            if x > 0 {
+                push_if(&mut stack, &mut seen, mask, c - 1);
+            }
+            if x + 1 < w {
+                push_if(&mut stack, &mut seen, mask, c + 1);
+            }
+            if y > 0 {
+                push_if(&mut stack, &mut seen, mask, c - w);
+            }
+            if y + 1 < h {
+                push_if(&mut stack, &mut seen, mask, c + w);
+            }
+        }
+
+        out.push(blob);
+    }
+
+    out.sort_by_key(|b| std::cmp::Reverse(b.len()));
+    out
+}
+
+fn push_if(stack: &mut Vec<usize>, seen: &mut [bool], mask: &[bool], c: usize) {
+    if mask[c] && !seen[c] {
+        seen[c] = true;
+        stack.push(c);
+    }
+}
+
+fn bounding_box(blob: &[usize], w: usize) -> (usize, usize, usize, usize) {
+    let mut x0 = usize::MAX;
+    let mut y0 = usize::MAX;
+    let mut x1 = 0;
+    let mut y1 = 0;
+
+    for &c in blob {
+        let (x, y) = (c % w, c / w);
+        x0 = x0.min(x);
+        y0 = y0.min(y);
+        x1 = x1.max(x);
+        y1 = y1.max(y);
+    }
+
+    (x0, y0, x1, y1)
+}
+
+fn busy_fraction(blob: &[usize], frames: &[Vec<u8>]) -> f64 {
+    let mut busy = 0;
+
+    for pair in frames.windows(2) {
+        let mut sum = 0.0f64;
+        for &c in blob {
+            sum += (pair[1][c] as i16 - pair[0][c] as i16).abs() as f64;
+        }
+        let mean = sum / blob.len() as f64;
+
+        if mean > 0.5 {
+            busy += 1;
+        }
+    }
+
+    busy as f64 / (frames.len() - 1) as f64
+}
+
+fn detect_freezes(input: &str, crop: &str) -> Result<Vec<(f64, Option<f64>)>> {
+    let filter = format!("crop={crop},fps=5,freezedetect=n=-58dB:d=2.0");
+
+    let out = Command::new("ffmpeg")
+        .args(["-i", input, "-vf", &filter, "-an", "-f", "null", "-"])
+        .output()
+        .context("could not run ffmpeg. Is it installed and on PATH?")?;
+
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        bail!("freezedetect failed: {}", stderr.trim());
+    }
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let mut freezes: Vec<(f64, Option<f64>)> = Vec::new();
+
+    for line in stderr.lines() {
+        if let Some(v) = line.split("freeze_start: ").nth(1) {
+            if let Ok(t) = v.trim().parse::<f64>() {
+                freezes.push((t, None));
+            }
+        } else if let Some(v) = line.split("freeze_end: ").nth(1) {
+            if let Ok(t) = v.trim().parse::<f64>() {
+                if let Some(last) = freezes.last_mut() {
+                    last.1 = Some(t);
+                }
+            }
+        }
+    }
+
+    Ok(freezes)
+}
+
+fn paint_freezes(freezes: &[(f64, Option<f64>)], grid_len: usize, duration: f64) -> Vec<bool> {
+    let mut frozen = vec![false; grid_len];
+
+    for &(start, end) in freezes {
+        let end = end.unwrap_or(duration);
+        let i0 = ((start / 0.02) as usize).min(grid_len - 1);
+        let i1 = ((end / 0.02) as usize).min(grid_len);
+        for j in i0..i1 {
+            frozen[j] = true;
+        }
+    }
+
+    frozen
+}
+
 fn main() -> Result<()> {
     let args = Cli::parse();
-
-    println!("{:#?}", args);
 
     let json = ffprobe_json(&args.input)?;
 
     let probe: Probe = serde_json::from_str(&json)
         .with_context(|| format!("could not parse ffprobe output for {}", args.input))?;
 
-    println!("{:#?}", probe);
     let video = probe
         .streams
         .iter()
@@ -308,7 +484,7 @@ fn main() -> Result<()> {
         .and_then(parse_fps)
         .context("could not read frame rate")?;
 
-    println!("{:#?}", fps);
+    println!("fps         {fps:.3}");
 
     let width = video.width.context("video stream has no width")?;
     let height = video.height.context("video stream has no height")?;
@@ -332,9 +508,11 @@ fn main() -> Result<()> {
 
     let (input_i, input_tp) = measure_loudness(&args.input)?;
 
-    println!("input_i: {}, input_tp{}", input_i, input_tp);
-
     let gain_db = -23.0 - input_i;
+
+    println!("input_i     {input_i:.2} LUFS");
+    println!("input_tp    {input_tp:.2} dBTP");
+    println!("gain        {gain_db:+.2} dB");
 
     extract_audio(&args.input, &wav_path, gain_db)?;
 
@@ -391,8 +569,6 @@ fn main() -> Result<()> {
     let elapsed = t0.elapsed();
 
     println!("vad         {:.1} s", elapsed.as_secs_f64());
-    println!("chunk 1875  {:.4}  (60.0 s, expect high)", probs[1875]);
-    println!("chunk 18125 {:.4}  (580.0 s, expect low)", probs[18125]);
 
     let total = probs.len();
     let above = probs.iter().filter(|&&p| p >= 0.30).count();
@@ -405,20 +581,6 @@ fn main() -> Result<()> {
     println!("  <  0.15   {below}");
 
     let chunk_speech = hysteresis(&probs, 0.30, 0.15);
-
-    let naive: Vec<bool> = probs.iter().map(|&p| p >= 0.30).collect();
-
-    let transitions = |m: &[bool]| m.windows(2).filter(|w| w[0] != w[1]).count();
-
-    println!(
-        "hyst speech {:.1}%",
-        100.0 * chunk_speech.iter().filter(|&&b| b).count() as f64 / chunk_speech.len() as f64
-    );
-    println!(
-        "transitions naive {} -> hyst {}",
-        transitions(&naive),
-        transitions(&chunk_speech)
-    );
 
     let mut speech = vec![false; grid_len];
 
@@ -447,16 +609,8 @@ fn main() -> Result<()> {
 
     let padded = pad(&dropped_mask, 0.50, 0.55);
     let pct = 100.0 * padded.iter().filter(|&&b| b).count() as f64 / padded.len() as f64;
-    println!("padded      {pct:.1}%");
+    println!("speech:      {pct:.1}%");
 
-    let slice = (580.0 / 0.02) as usize; // 29000
-    println!("580s slice  {}", padded[slice]);
-    println!("chunk       {}", chunk_speech[18125]);
-    for j in (29000 - 100)..(29000 + 100) {
-        if padded[j] != padded[j.saturating_sub(1)] {
-            println!("  edge at {:.2}s -> {}", j as f64 * 0.02, padded[j]);
-        }
-    }
     println!("\nlongest silences:");
     for (rank, &(start, end)) in longest_silences(&padded, 10).iter().enumerate() {
         let t0 = start as f64 * 0.02;
@@ -470,5 +624,105 @@ fn main() -> Result<()> {
         );
     }
 
+    let frames = sample_frames(&args.input, duration)?;
+    println!("frames      {}", frames.len());
+
+    let activity = cell_activity(&frames);
+    let max = activity.iter().fold(0.0f32, |m, &a| m.max(a));
+    let mean = activity.iter().sum::<f32>() / activity.len() as f32;
+    println!("activity    max {max:.2}  mean {mean:.2}");
+    let (mask, threshold) = match content_mask(&activity) {
+        Some(v) => v,
+        None => {
+            println!("no content region (max activity below 2.0)");
+            // expect_screen = false, skip freeze detection
+            return Ok(());
+        }
+    };
+
+    let passing = mask.iter().filter(|&&b| b).count();
+    println!("threshold   {threshold:.2}  ({passing} cells pass)");
+
+    let bs = blobs(&mask, 160, 90);
+    println!("blobs       {}", bs.len());
+
+    const MIN_BLOB: usize = 50;
+    const MAX_BUSY: f64 = 0.90;
+
+    let mut content: Option<&Vec<usize>> = None;
+
+    for b in &bs {
+        if b.len() < MIN_BLOB {
+            continue;
+        }
+        let busy = busy_fraction(b, &frames);
+        println!(
+            "  {:5} cells   {:.1}% busy{}",
+            b.len(),
+            100.0 * busy,
+            if busy > MAX_BUSY {
+                "   [webcam, rejected]"
+            } else {
+                ""
+            }
+        );
+        if busy > MAX_BUSY {
+            continue;
+        }
+        if content.is_none() {
+            content = Some(b);
+        }
+    }
+
+    let content = match content {
+        Some(b) => b,
+        None => {
+            println!("no content region — all blobs rejected or too small");
+            return Ok(());
+        }
+    };
+
+    let (cx0, cy0, cx1, cy1) = bounding_box(content, 160);
+
+    let sx = width as f64 / 160.0;
+    let sy = height as f64 / 90.0;
+
+    let x = ((cx0 as f64 * sx) as usize) & !1;
+    let y = ((cy0 as f64 * sy) as usize) & !1;
+    let x1 = (((cx1 + 1) as f64 * sx).ceil() as usize).min(width as usize);
+    let y1 = (((cy1 + 1) as f64 * sy).ceil() as usize).min(height as usize);
+    let cw = (x1 - x + 1) & !1;
+    let ch = (y1 - y + 1) & !1;
+
+    println!("crop        {cw}:{ch}:{x}:{y}");
+
+    let crop = format!("{cw}:{ch}:{x}:{y}");
+    println!("crop        {crop}");
+
+    let freezes = detect_freezes(&args.input, &crop)?;
+
+    let total: f64 = freezes
+        .iter()
+        .map(|&(s, e)| e.unwrap_or(duration) - s)
+        .sum();
+
+    println!(
+        "freezes     {} blocks, {:.1} s frozen ({:.1}%)",
+        freezes.len(),
+        total,
+        100.0 * total / duration
+    );
+
+    let frozen = paint_freezes(&freezes, grid_len, duration);
+
+    let frozen_pct = 100.0 * frozen.iter().filter(|&&b| b).count() as f64 / grid_len as f64;
+    println!("frozen      {frozen_pct:.1}% of grid");
+    let dead = padded
+        .iter()
+        .zip(&frozen)
+        .filter(|&(&s, &f)| !s && f)
+        .count();
+
+    println!("dead        {:.1}%", 100.0 * dead as f64 / grid_len as f64);
     Ok(())
 }
