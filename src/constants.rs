@@ -148,3 +148,15 @@ pub const QUIET_RUN_S: f64 = 0.10;
 /// Widening this clipped words before QUIET_RUN_S existed. Do not widen it
 /// without that guard in place.
 pub const SNAP_S: f64 = 0.35;
+/// How far the edge guard may search from a run boundary.
+/// Bounded so a run that is loud throughout gets trimmed, not deleted.
+pub const MAX_SHRINK_S: f64 = 3.0;
+
+/// Extra backoff past the last loud frame, so a cut is not adjacent to speech.
+pub const EDGE_MARGIN_S: f64 = 0.15;
+
+/// A dead run may never be trimmed below this. Also the planner's floor.
+pub const MIN_DEAD_S: f64 = 1.0;
+
+/// Dead runs closer than this are merged before the length rules apply.
+pub const DEAD_BRIDGE_S: f64 = 2.0;
