@@ -1,16 +1,18 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::Instant;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::Parser;
 
 use elide::audio::{extract_audio, measure_loudness, Analysis};
 use elide::cli::Cli;
 use elide::constants::{
-    ACTIVITY_MIN, BRIDGE_GAP_S, DEAD_BRIDGE_S, EDGE_MARGIN_S, ENERGY_S, GATE_DB, GRID_H, GRID_S,
-    GRID_W, MAX_BUSY, MAX_SHRINK_S, MIN_BLOB, MIN_DEAD_S, MIN_SPEECH_S, PAD_AFTER_S, PAD_BEFORE_S,
-    QUIET_DB, SAMPLES_PER_SLICE, SAMPLE_RATE, TARGET_LUFS, VAD_CHUNK, VAD_ENTER, VAD_EXIT,
+    ACTIVITY_MIN, ATEMPO_MAX, BRIDGE_GAP_S, DEAD_BRIDGE_S, EDGE_MARGIN_S, ENERGY_S, GATE_DB,
+    GRID_H, GRID_S, GRID_W, MAX_BUSY, MAX_SHRINK_S, MIN_BLOB, MIN_DEAD_S, MIN_SPEECH_S,
+    PAD_AFTER_S, PAD_BEFORE_S, QUIET_DB, SAMPLES_PER_SLICE, SAMPLE_RATE, TARGET_LUFS, VAD_CHUNK,
+    VAD_ENTER, VAD_EXIT,
 };
 use elide::crop::{blobs, bounding_box, busy_fraction, cell_activity, content_mask, sample_frames};
 use elide::freeze::{detect_freezes, paint_freezes};
@@ -274,6 +276,120 @@ fn trim_edges(runs: &[(usize, usize)], energy: &[f64], gate_db: f64) -> Vec<(usi
     out
 }
 
+fn atempo_chain(speed: f64) -> String {
+    let mut parts = Vec::new();
+    let mut r = speed;
+
+    while r > ATEMPO_MAX {
+        parts.push(ATEMPO_MAX);
+        r /= ATEMPO_MAX;
+    }
+    parts.push(r);
+    parts
+        .iter()
+        .map(|p| format!("atempo={p:.6}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn render_segments(input: &str, seg: &Segment, out_path: &Path) -> Result<()> {
+    let mut cmd = Command::new("ffmpeg");
+
+    cmd.args([
+        "-y",
+        "-ss",
+        &format!("{:.6}", seg.src_start),
+        "-to",
+        &format!("{:.6}", seg.src_end),
+        "-i",
+        input,
+    ]);
+
+    if seg.speed != 1.0 {
+        cmd.args(["-vf", &format!("setpts=PTS/{:.6}", seg.speed)]);
+        cmd.args(["-af", &format!("{},volume=0", atempo_chain(seg.speed))]);
+    }
+
+    cmd.args([
+        "-c:v",
+        "libx264",
+        "-preset",
+        "fast",
+        "-crf",
+        "19",
+        "-profile:v",
+        "high",
+        "-pix_fmt",
+        "yuv420p",
+        "-g",
+        "120",
+        "-c:a",
+        "pcm_s16le",
+        "-ar",
+        "48000",
+        "-ac",
+        "2",
+    ]);
+    cmd.arg(out_path);
+
+    let out = cmd.output().context("could not run ffmpeg")?;
+    if !out.status.success() {
+        bail!(
+            "ffmpeg failed on segment: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+fn concat_segments(list_path: &Path, out_path: &Path) -> Result<()> {
+    let out = Command::new("ffmpeg")
+        .args(["-y", "-f", "concat", "-safe", "0", "-i"])
+        .arg(list_path)
+        .args(["-c", "copy"])
+        .arg(out_path)
+        .output()
+        .context("could not run ffmpeg")?;
+
+    if !out.status.success() {
+        bail!(
+            "concat failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+
+    Ok(())
+}
+
+fn finalize(concat_path: &Path, out_path: &Path) -> Result<()> {
+    let out = Command::new("ffmpeg")
+        .args(["-y", "-i"])
+        .arg(concat_path)
+        .args([
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-movflags",
+            "+faststart",
+        ])
+        .arg(out_path)
+        .output()
+        .context("could not run ffmpeg")?;
+
+    if !out.status.success() {
+        bail!(
+            "Finalize failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+
+    Ok(())
+}
+
+#[deny(unused_must_use)]
 fn main() -> Result<()> {
     let args = Cli::parse();
 
@@ -664,6 +780,41 @@ fn main() -> Result<()> {
     let path = temp_dir.join("plan.json");
     fs::write(&path, serde_json::to_string_pretty(&plan)?)
         .with_context(|| format!("could not write {}", path.display()))?;
+
+    let seg_dir = temp_dir.join("segments");
+    fs::create_dir_all(&seg_dir)
+        .with_context(|| format!("could not create {}", seg_dir.display()))?;
+
+    let mut seg_paths = vec![];
+    let t0 = Instant::now();
+
+    for (i, seg) in segs.iter().enumerate() {
+        let path = seg_dir.join(format!("seg_{i:03}.mkv"));
+        render_segments(&args.input, seg, &path)?;
+        seg_paths.push(path);
+    }
+
+    println!(
+        "rendered    {} segments in {:.1}s",
+        seg_paths.len(),
+        t0.elapsed().as_secs_f64()
+    );
+
+    let list_path = temp_dir.join("concat.txt");
+    let mut list = String::new();
+
+    for p in &seg_paths {
+        list.push_str(&format!("file {}\n", p.display()));
+    }
+
+    fs::write(&list_path, list)
+        .with_context(|| format!("could not write {}", list_path.display()))?;
+
+    let concat_path = temp_dir.join("concat.mkv");
+    concat_segments(&list_path, &concat_path)?;
+
+    let out_path = PathBuf::from(&args.output).join("out.mp4");
+    finalize(&concat_path, &out_path)?;
 
     Ok(())
 }

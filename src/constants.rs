@@ -160,3 +160,6 @@ pub const MIN_DEAD_S: f64 = 1.0;
 
 /// Dead runs closer than this are merged before the length rules apply.
 pub const DEAD_BRIDGE_S: f64 = 2.0;
+
+/// ffmpeg's atempo filter accepts 0.5–2.0 only; higher speeds chain instances.
+pub const ATEMPO_MAX: f64 = 2.0;
