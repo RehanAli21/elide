@@ -163,3 +163,13 @@ pub const DEAD_BRIDGE_S: f64 = 2.0;
 
 /// ffmpeg's atempo filter accepts 0.5–2.0 only; higher speeds chain instances.
 pub const ATEMPO_MAX: f64 = 2.0;
+
+/// Removes rumble below speech. The reference uses 75, not 80.
+pub const HIGHPASS_HZ: u32 = 75;
+
+/// True-peak ceiling for the delivered programme.
+pub const MASTER_TP: f64 = -1.5;
+
+/// Applied only when flat gain to MASTER_LUFS would exceed MASTER_TP.
+/// makeup=8 supplies most of the gain so loudnorm's limiter isn't doing the work.
+pub const COMPRESSOR: &str = "acompressor=threshold=-28dB:ratio=3:attack=10:release=250:makeup=8";

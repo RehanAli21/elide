@@ -9,10 +9,10 @@ use clap::Parser;
 use elide::audio::{extract_audio, measure_loudness, Analysis};
 use elide::cli::Cli;
 use elide::constants::{
-    ACTIVITY_MIN, ATEMPO_MAX, BRIDGE_GAP_S, DEAD_BRIDGE_S, EDGE_MARGIN_S, ENERGY_S, GATE_DB,
-    GRID_H, GRID_S, GRID_W, MAX_BUSY, MAX_SHRINK_S, MIN_BLOB, MIN_DEAD_S, MIN_SPEECH_S,
-    PAD_AFTER_S, PAD_BEFORE_S, QUIET_DB, SAMPLES_PER_SLICE, SAMPLE_RATE, TARGET_LUFS, VAD_CHUNK,
-    VAD_ENTER, VAD_EXIT,
+    ACTIVITY_MIN, ATEMPO_MAX, BRIDGE_GAP_S, COMPRESSOR, DEAD_BRIDGE_S, EDGE_MARGIN_S, ENERGY_S,
+    GATE_DB, GRID_H, GRID_S, GRID_W, HIGHPASS_HZ, MASTER_LUFS, MASTER_TP, MAX_BUSY, MAX_SHRINK_S,
+    MIN_BLOB, MIN_DEAD_S, MIN_SPEECH_S, PAD_AFTER_S, PAD_BEFORE_S, QUIET_DB, SAMPLES_PER_SLICE,
+    SAMPLE_RATE, TARGET_LUFS, VAD_CHUNK, VAD_ENTER, VAD_EXIT,
 };
 use elide::crop::{blobs, bounding_box, busy_fraction, cell_activity, content_mask, sample_frames};
 use elide::freeze::{detect_freezes, paint_freezes};
@@ -389,6 +389,45 @@ fn finalize(concat_path: &Path, out_path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn master(input: &Path, out: &Path, compress: bool) -> Result<()> {
+    let mut parts = vec![
+        format!("highpass=f={HIGHPASS_HZ}"),
+        "afftdn=nr=12:nf=-45".to_string(),
+    ];
+    if compress {
+        parts.push(COMPRESSOR.to_string());
+    }
+    parts.push(format!("loudnorm=I={MASTER_LUFS}:TP={MASTER_TP}:LRA=11"));
+    let filter = parts.join(",");
+
+    let o = Command::new("ffmpeg")
+        .args(["-y", "-i"])
+        .arg(input)
+        .args([
+            "-c:v",
+            "copy",
+            "-ar",
+            "48000",
+            "-ac",
+            "2",
+            "-af",
+            &filter,
+            "-c:a",
+            "pcm_s16le",
+        ])
+        .arg(out)
+        .output()
+        .context("could not run ffmpeg")?;
+
+    if !o.status.success() {
+        bail!(
+            "master failed: {}",
+            String::from_utf8_lossy(&o.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
 #[deny(unused_must_use)]
 fn main() -> Result<()> {
     let args = Cli::parse();
@@ -438,7 +477,7 @@ fn main() -> Result<()> {
 
     let wav_path = temp_dir.join("a16.wav");
 
-    let (input_i, input_tp) = measure_loudness(&args.input)?;
+    let (input_i, input_tp) = measure_loudness(&args.input, TARGET_LUFS, &[])?;
 
     let gain_db = TARGET_LUFS - input_i;
 
@@ -813,8 +852,28 @@ fn main() -> Result<()> {
     let concat_path = temp_dir.join("concat.mkv");
     concat_segments(&list_path, &concat_path)?;
 
+    // --- M6: master ---
+    let highpass = format!("highpass=f={HIGHPASS_HZ}");
+    let (master_i, master_tp) = measure_loudness(
+        concat_path.to_str().context("non-UTF-8 path")?,
+        MASTER_LUFS,
+        &[&highpass, "afftdn=nr=12:nf=-45"],
+    )?;
+
+    let master_gain = MASTER_LUFS - master_i;
+    let would_clip = master_tp + master_gain > MASTER_TP;
+
+    println!("master_i    {master_i:.2} LUFS");
+    println!("master_tp   {master_tp:.2} dBTP");
+    println!("gain        {master_gain:+.2} dB");
+    println!("compressor  {}", if would_clip { "yes" } else { "no" });
+
+    let master_path = temp_dir.join("master.mkv");
+    master(&concat_path, &master_path, would_clip)?;
+
     let out_path = PathBuf::from(&args.output).join("out.mp4");
-    finalize(&concat_path, &out_path)?;
+    finalize(&master_path, &out_path)?;
+    println!("wrote       {}", out_path.display());
 
     Ok(())
 }

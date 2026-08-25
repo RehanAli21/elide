@@ -1,5 +1,4 @@
-use crate::constants::TARGET_LUFS;
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::process::Command;
@@ -21,17 +20,12 @@ pub struct Analysis {
     pub src_duration_s: f64,
 }
 
-pub fn measure_loudness(input: &str) -> Result<(f64, f64)> {
+pub fn measure_loudness(input: &str, target_lufs: f64, prefilter: &[&str]) -> Result<(f64, f64)> {
+    let mut parts: Vec<String> = prefilter.iter().map(|s| s.to_string()).collect();
+    parts.push(format!("loudnorm=I={target_lufs}:print_format=json"));
+    let filter = parts.join(",");
     let out = Command::new("ffmpeg")
-        .args([
-            "-i",
-            input,
-            "-af",
-            format!("loudnorm=I={TARGET_LUFS}:print_format=json").as_str(),
-            "-f",
-            "null",
-            "-",
-        ])
+        .args(["-i", input, "-af", &filter, "-f", "null", "-"])
         .output()
         .context("could not run ffmpeg. Is it installed and on PATH?")?;
 
