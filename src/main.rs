@@ -428,6 +428,265 @@ fn master(input: &Path, out: &Path, compress: bool) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug)]
+struct Check {
+    name: &'static str,
+    passed: bool,
+    detail: String,
+}
+
+// ---------------------------------------------------------------- 5. faststart
+
+fn check_faststart(out_path: &Path) -> Result<Check> {
+    // read the first 64 KB and look for moov before mdat
+    let bytes = fs::read(out_path).context("could not read output")?;
+    let head = &bytes[..bytes.len().min(65536)];
+
+    let moov = find_atom(head, b"moov");
+    let mdat = find_atom(head, b"mdat");
+
+    let passed = match (moov, mdat) {
+        (Some(m), Some(d)) => m < d,
+        (Some(_), None) => true, // moov early, mdat past the window
+        _ => false,
+    };
+
+    Ok(Check {
+        name: "faststart",
+        passed,
+        detail: format!("moov at {moov:?}, mdat at {mdat:?}"),
+    })
+}
+
+fn find_atom(bytes: &[u8], tag: &[u8; 4]) -> Option<usize> {
+    bytes.windows(4).position(|w| w == tag)
+}
+
+// ----------------------------------------------------------------- 4. loudness
+
+fn check_loudness(out_path: &Path) -> Result<Check> {
+    let (i, tp) = measure_loudness(
+        out_path.to_str().context("non-UTF-8 path")?,
+        MASTER_LUFS,
+        &[],
+    )?;
+
+    let passed = (i - MASTER_LUFS).abs() <= 0.1 && tp <= MASTER_TP + 0.3;
+
+    Ok(Check {
+        name: "loudness",
+        passed,
+        detail: format!("{i:.2} LUFS, {tp:.2} dBTP"),
+    })
+}
+
+// ---------------------------------------------------------- 2. word-clip guard
+
+fn check_word_clips(samples: &[f32], sample_rate: u32, plan: &Plan) -> Result<Check> {
+    let gate = MASTER_LUFS - 15.78;
+    let window = (0.02 * sample_rate as f64) as usize;
+    let mut failures = 0;
+
+    for seg in plan.segments.iter().skip(1) {
+        let idx = (seg.out_start * sample_rate as f64) as usize;
+        if idx < window || idx + window >= samples.len() {
+            continue;
+        }
+
+        let before = rms_db(&samples[idx - window..idx]);
+        let after = rms_db(&samples[idx..idx + window]);
+
+        if before > gate && after > gate {
+            failures += 1;
+            println!(
+                "  clip? at {:.2}s  before {before:.1} after {after:.1}",
+                seg.out_start
+            );
+        }
+    }
+
+    Ok(Check {
+        name: "word clips",
+        passed: failures == 0,
+        detail: format!("{failures} / {}", plan.segments.len() - 1),
+    })
+}
+
+fn rms_db(chunk: &[f32]) -> f64 {
+    let sum: f64 = chunk.iter().map(|&s| (s as f64) * (s as f64)).sum();
+    20.0 * (sum / chunk.len() as f64).sqrt().max(1e-10).log10()
+}
+
+// ------------------------------------------------------------------ 3. a/v sync
+
+fn check_sync(input: &str, out_path: &Path, temp_dir: &Path, plan: &Plan) -> Result<Check> {
+    let n = 7;
+    let mut scores = Vec::new();
+
+    for k in 1..=n {
+        let out_t = plan.out_duration_s * k as f64 / (n + 1) as f64;
+        let src_t = match map_to_source(plan, out_t) {
+            Some(t) => t,
+            None => continue,
+        };
+
+        let a = temp_dir.join(format!("sync_out_{k}.png"));
+        let b = temp_dir.join(format!("sync_src_{k}.png"));
+
+        grab_frame(out_path.to_str().unwrap(), out_t, &a)?;
+        grab_frame(input, src_t, &b)?;
+
+        scores.push(ssim(&a, &b)?);
+    }
+
+    let worst = scores.iter().cloned().fold(1.0f64, f64::min);
+
+    Ok(Check {
+        name: "a/v sync",
+        passed: worst >= 0.90,
+        detail: format!("worst {worst:.3} over {} checkpoints", scores.len()),
+    })
+}
+
+fn map_to_source(plan: &Plan, out_t: f64) -> Option<f64> {
+    for s in &plan.segments {
+        if out_t >= s.out_start && out_t < s.out_end {
+            let into = out_t - s.out_start;
+            return Some(s.src_start + into * s.speed);
+        }
+    }
+    None
+}
+
+fn grab_frame(input: &str, t: f64, out_path: &Path) -> Result<()> {
+    let out = Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-ss",
+            &format!("{t:.6}"),
+            "-i",
+            input,
+            "-frames:v",
+            "1",
+            "-q:v",
+            "2",
+        ])
+        .arg(out_path)
+        .output()
+        .context("could not run ffmpeg")?;
+
+    if !out.status.success() {
+        bail!(
+            "frame grab failed at {t:.2}s: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+fn ssim(a: &Path, b: &Path) -> Result<f64> {
+    let out = Command::new("ffmpeg")
+        .args(["-i"])
+        .arg(a)
+        .args(["-i"])
+        .arg(b)
+        .args(["-lavfi", "ssim", "-f", "null", "-"])
+        .output()
+        .context("could not run ffmpeg")?;
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let all = stderr
+        .split("All:")
+        .nth(1)
+        .context("no SSIM in ffmpeg output")?;
+    let value = all.split_whitespace().next().context("bad SSIM output")?;
+    value.parse().context("could not parse SSIM")
+}
+
+fn read_wav(path: &Path) -> Result<(Vec<f32>, u32)> {
+    let reader =
+        WavReader::open(path).with_context(|| format!("could not open {}", path.display()))?;
+    let rate = reader.spec().sample_rate;
+    let samples: Vec<f32> = reader
+        .into_samples::<f32>()
+        .collect::<Result<Vec<f32>, _>>()?;
+    Ok((samples, rate))
+}
+
+fn extract_verify_audio(out_path: &Path, wav_path: &Path) -> Result<()> {
+    let out = Command::new("ffmpeg")
+        .args(["-y", "-i"])
+        .arg(out_path)
+        .args(["-vn", "-ac", "1", "-ar", "48000", "-c:a", "pcm_f32le"])
+        .arg(wav_path)
+        .output()
+        .context("could not run ffmpeg")?;
+
+    if !out.status.success() {
+        bail!(
+            "verify audio extraction failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+fn check_clicks(samples: &[f32], sample_rate: u32, plan: &Plan) -> Result<Check> {
+    let mut diffs: Vec<f32> = samples.windows(2).map(|w| (w[1] - w[0]).abs()).collect();
+    diffs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let p999 = diffs[(diffs.len() as f64 * 0.999) as usize];
+
+    let mut worst = 0.0f32;
+    let mut failures = 0;
+
+    for seg in plan.segments.iter().skip(1) {
+        let idx = (seg.out_start * sample_rate as f64) as usize;
+        if idx == 0 || idx >= samples.len() {
+            continue;
+        }
+        let jump = (samples[idx] - samples[idx - 1]).abs();
+        worst = worst.max(jump);
+        if jump > p999 {
+            failures += 1;
+        }
+    }
+
+    Ok(Check {
+        name: "splice clicks",
+        passed: failures == 0,
+        detail: format!(
+            "{failures} / {} (worst {worst:.4} vs p99.9 {p999:.4})",
+            plan.segments.len() - 1
+        ),
+    })
+}
+
+fn verify(input: &str, out_path: &Path, temp_dir: &Path, plan: &Plan) -> Result<Vec<Check>> {
+    let mut checks = Vec::new();
+
+    // 5. faststart
+    checks.push(check_faststart(out_path)?);
+
+    // 4. loudness
+    checks.push(check_loudness(out_path)?);
+
+    // extract the delivered audio once — 1 and 2 both read it
+    let verify_wav = temp_dir.join("verify.wav");
+    extract_verify_audio(out_path, &verify_wav)?;
+    let (samples, rate) = read_wav(&verify_wav)?;
+
+    // 1. splice clicks
+    checks.push(check_clicks(&samples, rate, plan)?);
+
+    // 2. word clips
+    checks.push(check_word_clips(&samples, rate, plan)?);
+
+    // 3. a/v sync
+    checks.push(check_sync(input, out_path, temp_dir, plan)?);
+
+    Ok(checks)
+}
+
 #[deny(unused_must_use)]
 fn main() -> Result<()> {
     let args = Cli::parse();
@@ -843,7 +1102,7 @@ fn main() -> Result<()> {
     let mut list = String::new();
 
     for p in &seg_paths {
-        list.push_str(&format!("file {}\n", p.display()));
+        list.push_str(&format!("file '{}'\n", p.display()));
     }
 
     fs::write(&list_path, list)
@@ -874,6 +1133,22 @@ fn main() -> Result<()> {
     let out_path = PathBuf::from(&args.output).join("out.mp4");
     finalize(&master_path, &out_path)?;
     println!("wrote       {}", out_path.display());
+
+    let checks = verify(&args.input, &out_path, &temp_dir, &plan)?;
+
+    println!("\nverification:");
+    for c in &checks {
+        println!(
+            "  {:<16} {}  {}",
+            c.name,
+            if c.passed { "PASS" } else { "FAIL" },
+            c.detail
+        );
+    }
+
+    if checks.iter().any(|c| !c.passed) {
+        bail!("export failed verification");
+    }
 
     Ok(())
 }
