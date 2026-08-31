@@ -1,0 +1,552 @@
+# elide — handoff, M0 through M7
+
+State as of the end of the M7 session. Everything through M7 is built and
+verified against two real videos — all five verification checks pass on both.
+Three things were closed in the follow-up session: the word-clip check was
+removed, mastering became two-pass, and the duration check was added. See the
+changelog note under **M7** and the resolved items under **Open issues**.
+
+This document records what was built, what was *decided and why*, and what the
+measured numbers were. The reasoning matters more than the code: several
+decisions here were reversed once after measurement, and the reversals are the
+useful part.
+
+---
+
+## The tool
+
+Three inputs, per `CLI_AND_PROMPT.md`:
+
+```
+elide --input demo.mp4 --output out/ --prompt "demo of my app, for YouTube"
+```
+
+The prompt is parsed into the CLI struct but **not yet used**. Policy parsing
+(`CLI_AND_PROMPT.md` §2) is unbuilt.
+
+---
+
+## Layout
+
+```
+src/
+  main.rs        orchestration + all M4-M7 logic (not yet split out)
+  lib.rs         module declarations
+  constants.rs   every threshold, documented, with the evidence behind it
+  cli.rs         the three inputs
+  probe.rs       ffprobe, Probe/Format/Stream structs, parse_fps
+  audio.rs       measure_loudness, measure_loudnorm (two-pass stats),
+                 extract_audio, Loudnorm, LoudnormStats, Analysis
+  vad.rs         hysteresis, bridge, drop_bursts, pad, longest_silences
+  crop.rs        sample_frames, cell_activity, content_mask, blobs,
+                 bounding_box, busy_fraction
+  freeze.rs      detect_freezes, paint_freezes
+  utilities.rs   fmt_time
+```
+
+`main.rs` and `lib.rs` are **separate crates**. `main.rs` uses `elide::module::item`,
+never `mod`. Modules inside the library use `crate::`.
+
+M4-M7 code (planner, render, master, verify) still lives in `main.rs` and has
+not been split into `plan.rs` / `render.rs` / `master.rs` / `verify.rs`. That
+split is deliberate deferred work, not an oversight — the shape was still
+moving.
+
+---
+
+## Rule A — the time grid
+
+The one thing that is expensive to change later. Settled before M2 and
+unchanged since.
+
+- **20 ms grid.** Every mask in the program is a `Vec<bool>` of identical
+  length, indexed identically.
+- **`grid_len = samples / 320`**, integer division. The trailing partial slice
+  is dropped (9 ms on the demo file; too short to contain a decision).
+- **Energy is computed at 10 ms**, finer than the grid, because the quiet-run
+  guard measures a 0.10 s stretch and 20 ms frames give only 5 samples to judge
+  it. Grid slice `i` covers energy frames `2i` and `2i+1`.
+- **Span → index truncates, then clamps** to `grid_len - 1`.
+- **`grid_len` and `src_duration_s` are separate values and must never be
+  substituted for each other.** The grid ends ~40 ms before the video does.
+  `grid_len` comes from the audio samples; the last segment's `src_end` comes
+  from ffprobe. Naming them distinctly in code is deliberate.
+
+---
+
+## What each milestone does
+
+### M0 — probe
+`ffprobe -v error -print_format json -show_format -show_streams`. Parses
+duration, resolution, fps (from `r_frame_rate`, a fraction string), audio
+sample rate.
+
+Two distinct failure paths that must stay distinct: `.output()` fails only when
+the binary can't be *spawned* (ffmpeg not installed); a process that ran and
+failed returns `Ok` with `status.success() == false` (file missing, not a
+video).
+
+### M1 — audio into memory, normalised
+
+Corrected during the session — `BUILD_STEPS.md` was missing the normalisation
+step. Actual sequence:
+
+1. `measure_loudness(input, TARGET_LUFS, &[])` → `input_i`, `input_tp`
+2. `gain = TARGET_LUFS - input_i`
+3. extract with `-af "volume={gain}dB" -vn -ac 1 -ar 16000 -c:a pcm_f32le`
+4. read with hound as `f32`, **no division by 32768**
+5. write `analysis.json`
+
+**Why `pcm_f32le` and not `pcm_s16le`:** measured peak after gain on the demo
+file was **1.145**, with 23 samples above 1.0. In s16 those would have clipped
+permanently. The overshoot comes from resampler ringing — 48 kHz → 16 kHz
+anti-aliasing produces sample values above the source's true peak.
+
+The alternative (clamp the gain to preserve headroom) was rejected: it would
+make the file sit at something other than −23 LUFS, so `QUIET` and `GATE` would
+mean different things on different files, which is exactly what normalising was
+for.
+
+**Sanity print:** max absolute sample should be roughly 0.1–1.0. If it reads
+~0.00003, the `/32768.0` is still in there.
+
+`loudnorm` prints its JSON block to **stderr**, not stdout, mixed with the
+banner. Bracket it with `find('{')` and `rfind('}')`.
+
+### M2 — speech mask
+
+```
+samples → probs (512-sample chunks) → hysteresis → paint onto 20 ms grid
+        → bridge → drop bursts → pad
+```
+
+Uses the `voice_activity_detector` crate (Silero v5 via `ort`).
+
+**Silero does not return speech spans.** `BUILD_STEPS.md` says it does; that's
+`get_speech_timestamps()`, a Python helper. The ONNX graph returns one
+probability per chunk. Window size is fixed at 512 samples @ 16 kHz — not
+configurable.
+
+**Hysteresis was added, and it earns its place.** Neither `predict()` nor
+`label()` in the crate does it. Enter 0.30, exit 0.15 (Silero's own
+`threshold - 0.15`). Measured: 2416 transitions without → 1638 with. 6.2% of
+chunks sat in the dead band.
+
+If `VAD_ENTER` is ever swept downward, floor `VAD_EXIT` at 0.01 — at enter 0.15
+a derived exit of 0.00 means speech, once started, never ends.
+
+**Chunk-to-slice painting:** 512-sample chunks vs 320-sample slices realign
+every 160 ms. Slice `i` takes the answer from the chunk containing its midpoint
+sample: `(i * 320 + 160) / 512`. Truncating, consistent with everything else.
+
+Post-processing order is fixed: **bridge, then drop, then pad.** Bridging first
+means a bridged pair counts as one long run rather than two short ones that get
+deleted. Padding last, because padding first would create overlaps the other
+passes would mangle.
+
+Each pass **clones its input and writes to the clone.** Reading and writing the
+same array lets a flip change what the next iteration sees.
+
+Run lengths are compared **in seconds**, not converted to slice counts —
+`run_len as f64 * GRID_S < 0.35`. Removes a 17-vs-18 decision that would
+otherwise be made independently in three places.
+
+### M3 — content region + freeze mask
+
+Auto-crop was moved *into* M3 rather than deferred past M8, because the two
+test videos need incompatible crops (a phone emulator and a full browser), so
+manual `--crop` doesn't survive even a two-file test set. `--crop` remains a
+documented override but is **not implemented yet**.
+
+```
+1. sample 200 frames (fps = 200/duration), 160x90 greyscale
+2. per-cell mean absolute frame-to-frame difference
+3. if max activity < ACTIVITY_MIN -> no content region, expect_screen=false
+   else threshold = ACTIVITY_RATIO * max
+4. 4-neighbour connected components, sorted by size
+5. drop blobs < MIN_BLOB cells
+6. reject blobs busy in > MAX_BUSY of frames  (webcam)
+7. largest survivor -> bounding box -> scale to full res -> snap even
+8. freezedetect with that crop -> parse -> paint onto the grid
+```
+
+**The mask threshold must be relative.** An earlier absolute floor of
+`max(0.08*max, 0.5)` silently clipped the mask on densely-sampled files and
+shattered the extension video's content region into 125 fragments with a top
+blob of 373 cells instead of ~2900. Frame-to-frame activity scales with the gap
+between sampled frames, and a fixed 200-frame count makes that gap
+duration-dependent. Removing the floor and moving the no-signal test to
+`max < 2.0` fixed it.
+
+That is the **third** instance of the same bug class in this project:
+absolute dB thresholds across four videos spanning 12.2 dB; the VAD threshold
+tuned on un-normalised audio; and this. Any new absolute constant deserves
+suspicion.
+
+**Full-frame freezedetect under-fires, it doesn't over-fire.** Measured on the
+demo video: with crop 80 blocks / 1042.7 s frozen; full frame 150 blocks /
+737.3 s. More blocks, *less* frozen time — the webcam bubble and taskbar clock
+chop long frozen stretches into sub-threshold pieces. Without the crop you lose
+333 s of real dead air on a video where the finished edit removes ~324 s total.
+
+**Face detection is specified but deferred.** Step 4 of the ranking (face-check
+blobs already flagged as webcam-suspect, reject only those with a face) is
+documented and unbuilt. Reason: the motion rule alone separates cleanly on both
+test files (app 33.7% busy, webcam 100%), so the face check would only confirm
+a decision already made correctly. The case it exists for — an app window that
+is itself constantly changing (gameplay, video playback, scrolling terminal)
+alongside a webcam overlay — is not in the test set.
+
+Under `face_bubble=no`, "all blobs flagged" is indistinguishable from "no screen
+content": both produce no survivor and route to audio-only dead air. Printing
+the blob table on every run is what makes the two cases distinguishable in
+hindsight.
+
+If built: use `rustface` (SeetaFace, pure Rust, no second ML runtime).
+Never run it on the full frame — run it per candidate blob crop. Measured cost:
+2.60 s full frame vs 0.85 s on a 264x312 crop.
+
+### M4 — the plan
+
+```
+dead_runs(speech, frozen)          (!speech AND frozen)
+  -> bridge_dead(2.0 s)            merge, then re-apply "AND not speech"
+  -> filter to >= MIN_DEAD_S
+  -> trim_edges(smoothed energy)   the edge guard
+  -> decide()                      Keep / Collapse / Speed
+  -> build_segments()
+  -> merge_adjacent()
+  -> plan.json
+```
+
+**Order matters and was got wrong once.** The `min_dead` filter must come
+*after* bridging, not before — filtering first removes short runs that would
+have merged into qualifying ones.
+
+**`bridge_dead` step 2 is not a formality.** Merging joins two dead runs across
+whatever sits between them, which may be speech. Re-splitting on `!speech`
+cuts it back out. Note it deliberately does *not* restore the `frozen`
+condition — that's how "quiet, but the mouse twitched once" becomes one dead
+block rather than three.
+
+**The edge guard (`trim_edges`)** matches the Python reference exactly, after
+three rounds of correction:
+
+- works on **10 ms energy frames**, indexing the array directly. An earlier
+  version worked on 20 ms slices via a helper that took the *max* of the two
+  covering frames — an OR that made "loud" fire roughly twice as often and
+  over-trimmed by 70 s.
+- reads **smoothed** energy (3-frame boxcar, 30 ms), not raw.
+- leading edge takes the **last** loud frame in the first `MAX_SHRINK_S`;
+  trailing edge takes the **first** loud frame in the last `MAX_SHRINK_S`.
+  Not "walk inward until quiet" — a word can dip mid-syllable.
+- trailing window uses the **already-updated** start. Order matters.
+- clamps are unconditional: `start <= b - min_dead`, `end >= start + min_dead`.
+  So the guard **never deletes a run**. Runs piling up at exactly 1.0 s is the
+  design, not a symptom.
+- input must be pre-filtered to `>= MIN_DEAD_S` or `b - min_dead` underflows.
+
+**`decide()`:**
+
+```
+< 1.0 s   -> Keep (untouched)
+1-4 s     -> Collapse to 0.50 s (material discarded)
+>= 4.0 s  -> target = clamp(d/12, 1.2, 6.0); speed = min(20, d/target)
+```
+
+The `/12` and the clamp interact: **any run between 14.4 s and 72 s gets
+exactly 12x**, because the 12 divides out. Below 14.4 s the 1.2 clamp binds;
+above 72 s the 6.0 clamp binds. The `min(20, ...)` cap only fires above 120 s
+and never fired on the test files.
+
+**`merge_adjacent`** joins consecutive segments with the same speed that are
+contiguous in source time. Without it, every collapse splits the timeline into
+an artificial pair (45 segments instead of 28), and each boundary is a splice
+that carries no edit.
+
+**`plan.json` stores both `src_*` and `out_*`** rather than deriving one from
+the other. M7's sync check maps *backwards* from output time to source time,
+and doing that from an accumulate-as-you-go list is where off-by-ones live.
+
+### M5 — render
+
+```
+per segment  -> temp/segments/seg_NNN.mkv   (28 files)
+concat       -> temp/concat.mkv             (-c copy)
+```
+
+Per-segment: `-ss {start} -to {end}` **before** `-i` (fast seek), then
+`-c:v libx264 -preset fast -crf 19 -profile:v high -pix_fmt yuv420p -g 120`
+and `-c:a pcm_s16le -ar 48000 -ac 2`.
+
+Sped segments add `-vf "setpts=PTS/{speed}"` and
+`-af "{atempo_chain},volume=0"`.
+
+**The atempo chain is for duration, not for sound.** ffmpeg's `atempo` accepts
+0.5–2.0 only, so 12x is `2,2,2,1.5`. Muting alone would leave a 52 s audio
+stream under a 4.3 s video segment and every subsequent segment would drift.
+`volume=0` is what stops it being chipmunk noise.
+
+The render is **the dominant cost** of the pipeline: ~340-380 s for 28 segments
+on the demo file, against ~9 s for VAD.
+
+Segments are `.mkv` because `.mp4` can't hold PCM. PCM is chosen so the concat
+has no codec delay or priming samples to re-align at 28 seams.
+
+### M6 — master
+
+```
+measure concat.mkv through [highpass, afftdn]  -> master_i, master_tp
+gain = MASTER_LUFS - master_i
+if master_tp + gain > MASTER_TP: insert compressor
+apply: two-pass loudnorm (see below)                     -> temp/master.mkv
+finalize: -c:v copy -c:a aac -b:a 192k -movflags +faststart  -> out.mp4
+```
+
+**Loudnorm is two-pass** (changed in the follow-up session). Single-pass
+loudnorm is a live estimate and is only accurate to ~0.2 LUFS, so the same
+chain landed −13.91 on the demo and −14.16 on the extension — the extension
+failed the ±0.1 loudness check. Two-pass fixes it: `master()` first measures
+the audio *through the full pre-loudnorm chain* (highpass → afftdn →
+[compressor]) with `print_format=json`, then applies loudnorm with those
+measured values fed back (`measured_I/TP/LRA/thresh`, `offset`, `linear=true`).
+Result: demo −14.00, extension −14.06 — both pass, both more accurate.
+
+**The measurement must include the compressor** when it is on, because in the
+apply pass loudnorm sits *after* the compressor. This is a different pass from
+the compressor-decision measurement above (which is `[highpass, afftdn]` only,
+because the compressor is what that measurement is deciding). Two measurement
+passes now, for two different questions.
+
+**Mastering measures the concatenated output, never the source.** 245 s were
+cut out of the middle; the loudest moment may have been in removed material,
+and the silent sped segments shift programme loudness. `input_tp` in
+`analysis.json` is a property of the source and is *not* used by M6.
+
+**The measurement pass must carry the same filter prefix as the apply pass**,
+minus the compressor (which is what's being decided). Measured on the extension
+file: the highpass alone raises true peak by 0.13 dB through filter ringing —
+the unsafe direction for a clipping conditional. This is a small correction to
+both the Python reference and `FLOW_SPEC.md`, which measure with highpass only
+and apply with highpass+afftdn.
+
+**`highpass=f=75`, not 80.** `FLOW_SPEC.md` §13 says 80; the code that produced
+the v6 render uses 75.
+
+**`makeup=8` in the compressor is load-bearing.** Bare `acompressor` at 2:1
+with no makeup would leave `loudnorm` to close an 8+ dB gap with its true-peak
+limiter, which is a brickwall and pumps. With makeup the compressor supplies
+most of the gain and loudnorm trims the remainder.
+
+Provenance caveat: the compressor string lives in `BUILD_STEPS.md`,
+`EDITING_PLAYBOOK.md` and `PROJECT_HANDOFF.md`, not in `render.py`. The Python
+reference stops after the measurement pass; the apply was run by hand. If the
+mastered output ever measures wrong, the string is as likely a suspect as the
+code.
+
+**Specify `-ar 48000 -ac 2` on the master pass.** Without it, ffmpeg negotiated
+192 kHz and the PCM stream came out at 6144 kb/s instead of 1536.
+
+### M7 — verification
+
+Five checks, any of which fails the export (non-zero exit via `bail!`).
+
+| check | how |
+| --- | --- |
+| duration | ffprobe `out.mp4` duration vs `plan.out_duration_s`, ≤ 0.5 s |
+| faststart | byte-search the first 64 KB for `moov` before `mdat` |
+| loudness | `measure_loudness` on `out.mp4`, compare to targets |
+| splice clicks | sample-to-sample jump at each `out_start`, vs the file's own p99.9 |
+| a/v sync | `map_to_source` at 7 checkpoints, grab both frames, ffmpeg `ssim` |
+
+**The duration check** guards the frame-rounding drift: sped segments round to
+whole frames, so the file runs slightly long. Measured +0.16 s on the demo,
++0.04 s on the extension — both inside the 0.5 s tolerance. It matters most for
+captions (M9), which must rescale the time map to the *measured* duration; that
+rescale is still unbuilt because captions are.
+
+**The word-clip check was removed** (follow-up session). It fired when both
+20 ms windows either side of a splice were loud, calling that a clipped word.
+But loud-on-both-sides is the *normal* result of collapsing dead air between
+two spoken phrases — the intended edit. Listening to all three failing points
+on the demo confirmed the cut lands exactly where the word ends; nothing was
+clipped. Actual clips are a *discontinuity*, already covered by the splice-click
+check (0/27). The check could only ever fail on correct edits, so it is gone.
+(For the record, its gate history: `GATE_DB = TARGET_LUFS - 15.78` = −38.78 was
+calibrated for −23 LUFS audio; the −14 LUFS output is 9 dB louder, and
+`MASTER_LUFS - 15.78` = −29.78 still gave 3 false failures. The threshold was
+never the real problem — the check's premise was.)
+
+The loudness tolerance on true peak needs ~0.3 dB of slack, not 0.1 — AAC
+encoding pushed −1.50 dBTP up to −1.38.
+
+---
+
+## Measured results
+
+### brainclean_demonstration.mp4 (1170.10 s, 1920x1080@60, −30.22 LUFS)
+
+```
+gain            +7.22 dB     peak 1.1450, 23 samples over 1.0
+grid_len        58503
+grid speech     43.2%   -> bridged 48.9% -> dropped 48.6% (21) -> padded 68.0%
+crop            384:828:768:108      (hand-measured: 374:820:773:113)
+blobs           1876 cells 33.7% busy | 326 cells 100.0% busy [rejected]
+freezes         77 blocks, 1042.7 s (89.1%)      ground truth: 80 / 1047.4
+dead            28.8% of grid
+energy          117006 frames (= grid_len x 2 exactly)
+                44.0% < QUIET | 10.8% mid | 45.2% >= GATE
+dead runs       99 raw -> 92 bridged -> 22 filtered -> 22 trimmed (43.5 s)
+                17 collapse, 5 speed-up
+segments        28
+output          925.1 s (20.9% removed)
+render          ~340-380 s
+master_i        -29.95 LUFS   master_tp -9.09 dBTP   gain +15.95   compressor yes
+final           -14.00 LUFS, -1.40 dBTP        (two-pass; was -13.91 single-pass)
+```
+
+Verification (all PASS): duration 925.22 s vs plan 925.06 s (**+0.16 s**),
+faststart, loudness −14.00 LUFS, splice clicks **0 / 27** (worst 0.0434 vs
+p99.9 0.1087), a/v sync **worst 0.991 over 7** (v6 was 0.980–0.993 with one
+outlier at 0.928).
+
+### brainclean_extension.mp4 (86.77 s, 1920x1080@60, −24.04 LUFS)
+
+```
+gain            +1.04 dB     peak 0.9035, 0 over
+grid_len        4337
+grid speech     74.7%  -> 82.7% -> 82.7% (0) -> 97.6%
+crop            1068:792:276:240
+freezes         7 blocks, 84.4 s (97.2%)
+dead            2.4%
+dead runs       5 raw -> 5 bridged -> 1 filtered -> 1 trimmed (0.2 s)
+segments        2
+output          86.3 s (0.6% removed)
+master_i        -24.16 LUFS   master_tp -4.15 dBTP   gain +10.16   compressor yes
+final           -14.06 LUFS, -1.33 dBTP        (two-pass; single-pass gave -14.16, FAIL)
+```
+
+Verification (all PASS): duration 86.30 s vs plan 86.27 s (**+0.04 s**),
+faststart, loudness −14.06 LUFS, splice clicks **0 / 1** (worst 0.0003 vs
+p99.9 0.2068), a/v sync **worst 0.999 over 7**. Before two-pass mastering this
+file **failed loudness at −14.16** and the export was refused — that genuine
+failure is also what proved a failed check blocks the export.
+
+**Python v6 reference produced 86.00 s from this file (0.9% removed).** Two
+independent implementations reaching the same conclusion on a file with
+essentially nothing to cut.
+
+### Cross-check: energy vs VAD
+
+45.2% of energy frames above `GATE_DB` against 43.2% raw grid speech on the
+demo file. Two independent measurements — one a neural VAD, one RMS energy —
+landing 2 points apart. The strongest available evidence that the dB thresholds
+transfer.
+
+Note the extension file reads **74.9%** above gate against 74.7% grid speech —
+also a match, but a much higher figure, because continuous narration pulls
+programme loudness up toward the speech level. The edge guard consequently has
+less to bite on: it trimmed 43.5 s on the demo file and 0.2 s on the extension.
+The guard does the most work exactly where there is the most to trim.
+
+---
+
+## Open issues
+
+### 1. Word-clip check — RESOLVED (check removed)
+
+The three failing points (78.34 s, 291.76 s, 635.73 s, all at collapse points,
+so 3 of 17) were listened to. The cut lands **exactly where the word ends** —
+nothing is clipped. It was the second hypothesis: the check was too strict, but
+more fundamentally its *premise* was wrong. "Loud on both sides of the splice"
+is the normal result of collapsing dead air between two phrases, not evidence of
+a clipped word. A real clip is a discontinuity, already caught by the
+splice-click check. The check could only fail on correct edits, so it was
+removed. See the M7 section for the full reasoning.
+
+### 2. Gap to the Python reference
+
+```
+                Rust M4/M5      Python v6      gap
+demonstration     925.1 s         845.7 s      79.4 s
+extension          86.3 s          86.00 s      0.3 s
+```
+
+The extension is effectively exact. The demonstration is ~79 s short of the
+reference. Roughly 40 s of that is the disfluency stage (v6 had 35 speech cuts,
+9 of them repeats), which is **unbuilt** — that's M11 (word alignment) and M13
+(disfluency removal). The remaining ~39 s is unexplained and worth chasing once
+the disfluency stage exists, not before.
+
+### 3. dts warnings on sped segments
+
+Hundreds of `non monotonically increasing dts` around frame 27258 (~454 s),
+adjacent to the 47.2 s speed-up at 457 s. `setpts=PTS/12` lands multiple source
+frames on the same output frame.
+
+**Probably benign.** SSIM came back 0.991 at all 7 checkpoints, better than the
+v6 reference. The warnings appear when writing to the null muxer. If they ever
+matter, the fix is `fps=60` after `setpts` in sped segments, forcing frame-rate
+resampling instead of duplicate frames — at the cost of re-rendering the 5 sped
+segments.
+
+### 4. `--crop` override not implemented
+
+Auto-crop works. The documented override does not exist yet.
+
+### 5. Prompt is unused
+
+Parsed into `Cli`, never read. `CLI_AND_PROMPT.md` §2's `Policy` struct — the
+JSON-schema-constrained single up-front model call, bounded fields, `ok=true`
+fallback when Ollama is unreachable — is entirely unbuilt.
+
+### 6. temp/ is never cleaned
+
+~1 GB per run on the demo file: 75 MB WAV, 28 segments, `concat.mkv` (273 MB),
+`master.mkv`, PNG frames from the sync check. Keeping the WAV was a deliberate
+choice (open it in Audacity when a mask looks wrong). The rest is undecided.
+
+### 7. `main.rs` has not been split
+
+M4-M7 logic all lives there. `FLOW_SPEC.md`'s suggested split names `plan`,
+`render`, `master`, `verify` as separate modules.
+
+---
+
+## Guards vs policy
+
+`CLI_AND_PROMPT.md` §1 is emphatic and it holds:
+
+**Guards are fixed in code, forever.** `QUIET_DB`, `GATE_DB`, `QUIET_RUN_S`,
+`SNAP_S`. The disfluency score (M13) rewards removing more seconds; it is only
+honest because these make damaging cuts *unavailable*. A prompt that could
+widen a guard could talk the pipeline into destroying the audio and would score
+itself higher for doing it.
+
+**Policy is what the prompt sets.** Whether to remove disfluencies, how hard to
+compress dead air, target loudness, pause floor, `expect_screen`,
+`face_bubble`.
+
+`QUIET_DB` and `GATE_DB` are *derived* from `TARGET_LUFS` in `constants.rs`
+rather than written as −44.78 and −38.78, so the coupling is in the code
+instead of only in someone's head.
+
+---
+
+## Habits that paid off
+
+- **Check numbers against arithmetic, not against plausibility.** 70206 frames
+  ÷ 60 fps = 1170.1 s, and 1170.1 s = 19:30, which matches `FLOW_SPEC.md`. That
+  is how you know the duration is real.
+- **Compare against an artifact, not against your own judgement.** The Python
+  produced `brainclean_extension_v6.mp4` at 86.00 s. That number settled a
+  question that listening could not.
+- **A print that never changes is a print that isn't measuring what you think.**
+  The smoothing bug hid for two rounds because the distribution being printed
+  read the raw array while the guard read the smoothed one.
+- **`?` on every fallible call.** A missing `?` on `concat_segments` made a
+  failing ffmpeg invocation silently succeed. `#![deny(unused_must_use)]` at
+  the top of `main.rs` turns that into a build error.
+- **rustc's `help:` blocks are local text fixes.** One suggested
+  `Result<(), E>` where the real problem was a missing import four lines up.
+  Treat them as hints about where the confusion is, not as patches to paste.

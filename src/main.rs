@@ -6,7 +6,7 @@ use std::time::Instant;
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 
-use elide::audio::{extract_audio, measure_loudness, Analysis};
+use elide::audio::{extract_audio, measure_loudness, measure_loudnorm, Analysis};
 use elide::cli::Cli;
 use elide::constants::{
     ACTIVITY_MIN, ATEMPO_MAX, BRIDGE_GAP_S, COMPRESSOR, DEAD_BRIDGE_S, EDGE_MARGIN_S, ENERGY_S,
@@ -390,14 +390,35 @@ fn finalize(concat_path: &Path, out_path: &Path) -> Result<()> {
 }
 
 fn master(input: &Path, out: &Path, compress: bool) -> Result<()> {
-    let mut parts = vec![
+    // The filters that run before loudnorm. loudnorm must be measured through
+    // exactly these, because this is the audio it will actually see.
+    let mut prefix = vec![
         format!("highpass=f={HIGHPASS_HZ}"),
         "afftdn=nr=12:nf=-45".to_string(),
     ];
     if compress {
-        parts.push(COMPRESSOR.to_string());
+        prefix.push(COMPRESSOR.to_string());
     }
-    parts.push(format!("loudnorm=I={MASTER_LUFS}:TP={MASTER_TP}:LRA=11"));
+
+    // Pass 1: measure the file as loudnorm will see it.
+    let prefix_refs: Vec<&str> = prefix.iter().map(|s| s.as_str()).collect();
+    let stats = measure_loudnorm(
+        input.to_str().context("non-UTF-8 path")?,
+        &prefix_refs,
+        MASTER_LUFS,
+        MASTER_TP,
+        11.0,
+    )?;
+
+    // Pass 2: apply, feeding the measured values back so loudnorm normalises
+    // from full knowledge of the file instead of a live guess.
+    let loud = format!(
+        "loudnorm=I={MASTER_LUFS}:TP={MASTER_TP}:LRA=11:\
+measured_I={:.2}:measured_TP={:.2}:measured_LRA={:.2}:measured_thresh={:.2}:offset={:.2}:linear=true",
+        stats.input_i, stats.input_tp, stats.input_lra, stats.input_thresh, stats.target_offset
+    );
+    let mut parts = prefix;
+    parts.push(loud);
     let filter = parts.join(",");
 
     let o = Command::new("ffmpeg")
@@ -480,44 +501,7 @@ fn check_loudness(out_path: &Path) -> Result<Check> {
     })
 }
 
-// ---------------------------------------------------------- 2. word-clip guard
-
-fn check_word_clips(samples: &[f32], sample_rate: u32, plan: &Plan) -> Result<Check> {
-    let gate = MASTER_LUFS - 15.78;
-    let window = (0.02 * sample_rate as f64) as usize;
-    let mut failures = 0;
-
-    for seg in plan.segments.iter().skip(1) {
-        let idx = (seg.out_start * sample_rate as f64) as usize;
-        if idx < window || idx + window >= samples.len() {
-            continue;
-        }
-
-        let before = rms_db(&samples[idx - window..idx]);
-        let after = rms_db(&samples[idx..idx + window]);
-
-        if before > gate && after > gate {
-            failures += 1;
-            println!(
-                "  clip? at {:.2}s  before {before:.1} after {after:.1}",
-                seg.out_start
-            );
-        }
-    }
-
-    Ok(Check {
-        name: "word clips",
-        passed: failures == 0,
-        detail: format!("{failures} / {}", plan.segments.len() - 1),
-    })
-}
-
-fn rms_db(chunk: &[f32]) -> f64 {
-    let sum: f64 = chunk.iter().map(|&s| (s as f64) * (s as f64)).sum();
-    20.0 * (sum / chunk.len() as f64).sqrt().max(1e-10).log10()
-}
-
-// ------------------------------------------------------------------ 3. a/v sync
+// ------------------------------------------------------------------ 2. a/v sync
 
 fn check_sync(input: &str, out_path: &Path, temp_dir: &Path, plan: &Plan) -> Result<Check> {
     let n = 7;
@@ -661,8 +645,36 @@ fn check_clicks(samples: &[f32], sample_rate: u32, plan: &Plan) -> Result<Check>
     })
 }
 
+// ---------------------------------------------------------- duration vs plan
+
+fn check_duration(out_path: &Path, plan: &Plan) -> Result<Check> {
+    let json = ffprobe_json(out_path.to_str().context("non-UTF-8 path")?)?;
+    let probe: Probe =
+        serde_json::from_str(&json).context("could not parse ffprobe output for out.mp4")?;
+    let measured: f64 = probe
+        .format
+        .duration
+        .parse()
+        .with_context(|| format!("bad out.mp4 duration {:?}", probe.format.duration))?;
+
+    let planned = plan.out_duration_s;
+    let diff = measured - planned;
+
+    Ok(Check {
+        name: "duration",
+        // sped segments round to whole frames, so the file runs a touch long.
+        // 0.5 s of slack per BUILD_STEPS M7; larger means the plan and the file
+        // genuinely disagree.
+        passed: diff.abs() <= 0.5,
+        detail: format!("{measured:.2}s vs plan {planned:.2}s ({diff:+.2}s)"),
+    })
+}
+
 fn verify(input: &str, out_path: &Path, temp_dir: &Path, plan: &Plan) -> Result<Vec<Check>> {
     let mut checks = Vec::new();
+
+    // duration vs plan
+    checks.push(check_duration(out_path, plan)?);
 
     // 5. faststart
     checks.push(check_faststart(out_path)?);
@@ -678,10 +690,7 @@ fn verify(input: &str, out_path: &Path, temp_dir: &Path, plan: &Plan) -> Result<
     // 1. splice clicks
     checks.push(check_clicks(&samples, rate, plan)?);
 
-    // 2. word clips
-    checks.push(check_word_clips(&samples, rate, plan)?);
-
-    // 3. a/v sync
+    // 2. a/v sync
     checks.push(check_sync(input, out_path, temp_dir, plan)?);
 
     Ok(checks)
