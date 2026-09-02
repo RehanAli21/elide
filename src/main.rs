@@ -957,7 +957,22 @@ fn main() -> Result<()> {
         .filter(|&(&s, &f)| !s && f)
         .count();
 
-    println!("dead        {:.1}%", 100.0 * dead as f64 / grid_len as f64);
+    let dead_pct = 100.0 * dead as f64 / grid_len as f64;
+    let removable_s = dead as f64 * GRID_S;
+    println!("dead        {dead_pct:.1}%");
+
+    // M8 pre-flight verdict — advisory only, changes no cut. This is the raw
+    // dead time (the ceiling); the real edit removes less, because collapses
+    // keep 0.5 s and speed-ups keep compressed time. Thresholds from
+    // PROJECT_HANDOFF §15: >=12% worth running, <5% little to cut.
+    let verdict = if dead_pct >= 12.0 {
+        "worth editing"
+    } else if dead_pct < 5.0 {
+        "little to cut — probably not worth it"
+    } else {
+        "marginal — some dead air, but not much"
+    };
+    println!("verdict     {verdict}  ({removable_s:.0}s removable, {dead_pct:.1}%)");
 
     let energy = energy_db(&samples, spec.sample_rate);
     println!(

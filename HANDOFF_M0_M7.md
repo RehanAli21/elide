@@ -2,9 +2,10 @@
 
 State as of the end of the M7 session. Everything through M7 is built and
 verified against two real videos — all five verification checks pass on both.
-Three things were closed in the follow-up session: the word-clip check was
-removed, mastering became two-pass, and the duration check was added. See the
-changelog note under **M7** and the resolved items under **Open issues**.
+Four things were done in the follow-up session: the word-clip check was
+removed, mastering became two-pass, the duration check was added, and M8 landed
+as a one-line pre-flight verdict (no separate command). See the notes under
+**M7** / **M8** and the resolved items under **Open issues**.
 
 This document records what was built, what was *decided and why*, and what the
 measured numbers were. The reasoning matters more than the code: several
@@ -379,6 +380,35 @@ never the real problem — the check's premise was.)
 
 The loudness tolerance on true peak needs ~0.3 dB of slack, not 0.1 — AAC
 encoding pushed −1.50 dBTP up to −1.38.
+
+### M8 — pre-flight verdict (built as one line, no separate command)
+
+`BUILD_STEPS.md` M8 specifies a separate audit that runs M1–M3 only and stops
+before rendering, to answer "is this worth editing?" cheaply. **We did not build
+it that way.** The decision (this session): no `--audit` flag, no early stop.
+
+Reasoning: the full run *already prints* every audit number (speech %, frozen %,
+dead %) before it renders — the audit is literally the first part of the normal
+run. The only thing missing was the verdict itself. So M8 is a single line
+printed on every run, right after `dead`:
+
+```
+verdict     worth editing  (337s removable, 28.8%)          # demo
+verdict     little to cut — probably not worth it  (2s removable, 2.4%)  # extension
+```
+
+- Thresholds (advisory, PROJECT_HANDOFF §15): **≥12% worth editing**, **<5%
+  little to cut**, between is "marginal". They change no cut, so they live inline
+  at `main.rs`, not in `constants.rs`.
+- The number is **raw dead time — a ceiling.** The real edit removes less
+  (collapses keep 0.5 s, speed-ups keep compressed time): demo 337 s "removable"
+  vs 245 s actually removed. The line says "removable", the code comment says
+  why.
+- **What we gave up:** there is no fast pre-flight that skips the ~350 s render
+  on a video with nothing to cut. You always run whole and read the verdict. If
+  that becomes annoying, the fix is small — add an `--audit` flag that `return`s
+  right after this line; no refactor needed, because the numbers already print
+  here.
 
 ---
 
