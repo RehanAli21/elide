@@ -1,699 +1,77 @@
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 
-use elide::audio::{extract_audio, measure_loudness, measure_loudnorm, Analysis};
+use elide::audio::{extract_audio, measure_loudness, Analysis};
 use elide::cli::Cli;
 use elide::constants::{
-    ACTIVITY_MIN, ATEMPO_MAX, BRIDGE_GAP_S, COMPRESSOR, DEAD_BRIDGE_S, EDGE_MARGIN_S, ENERGY_S,
-    GATE_DB, GRID_H, GRID_S, GRID_W, HIGHPASS_HZ, MASTER_LUFS, MASTER_TP, MAX_BUSY, MAX_SHRINK_S,
-    MIN_BLOB, MIN_DEAD_S, MIN_SPEECH_S, PAD_AFTER_S, PAD_BEFORE_S, QUIET_DB, SAMPLES_PER_SLICE,
-    SAMPLE_RATE, TARGET_LUFS, VAD_CHUNK, VAD_ENTER, VAD_EXIT,
+    ACTIVITY_MIN, BRIDGE_GAP_S, DEAD_BRIDGE_S, GATE_DB, GRID_H, GRID_S, GRID_W, HIGHPASS_HZ,
+    MASTER_LUFS, MASTER_TP, MAX_BUSY, MIN_BLOB, MIN_DEAD_S, MIN_SPEECH_S, PAD_AFTER_S, PAD_BEFORE_S,
+    QUIET_DB, SAMPLES_PER_SLICE, SAMPLE_RATE, TARGET_LUFS, VAD_CHUNK, VAD_ENTER, VAD_EXIT,
 };
 use elide::crop::{blobs, bounding_box, busy_fraction, cell_activity, content_mask, sample_frames};
+use elide::features::{energy_db, smooth};
 use elide::freeze::{detect_freezes, paint_freezes};
+use elide::master::{finalize, master};
+use elide::plan::{
+    bridge_dead, build_segments, dead_runs, decide, merge_adjacent, speedup_starts, trim_edges,
+    Action, Plan, PlanSegment,
+};
 use elide::probe::{ffprobe_json, parse_fps, Probe};
+use elide::render::{concat_segments, render_segments};
 use elide::utilities::fmt_time;
-use elide::vad::{bridge, drop_bursts, hysteresis, longest_silences, pad};
+use elide::vad::{bridge, drop_bursts, hysteresis, longest_silences, pad, speech_mask};
+use elide::verify::verify;
 use hound::WavReader;
-
-use serde::Serialize;
 use voice_activity_detector::{IteratorExt, VoiceActivityDetector};
 
-fn dead_runs(speech: &[bool], frozen: &[bool]) -> Vec<(usize, usize)> {
-    let mut runs = Vec::new();
-    let mut i = 0;
 
-    while i < speech.len() {
-        if speech[i] || !frozen[i] {
-            i += 1;
-            continue;
-        }
-
-        let start = i;
-        while i < speech.len() && !speech[i] && frozen[i] {
-            i += 1;
-        }
-        runs.push((start, i));
-    }
-
-    runs
-}
-
-fn bridge_dead(runs: &[(usize, usize)], speech: &[bool], max_gap_s: f64) -> Vec<(usize, usize)> {
-    if runs.is_empty() {
-        return Vec::new();
-    }
-
-    // 1. merge runs separated by less than max_gap_s
-    let mut merged: Vec<(usize, usize)> = Vec::new();
-    let mut cur = runs[0];
-
-    for &(start, end) in &runs[1..] {
-        let gap_s = (start - cur.1) as f64 * GRID_S;
-        if gap_s < max_gap_s {
-            cur.1 = end;
-        } else {
-            merged.push(cur);
-            cur = (start, end);
-        }
-    }
-    merged.push(cur);
-
-    // 2. re-apply "AND not speech" — a merge may have swallowed a word
-    let mut out = Vec::new();
-
-    for (start, end) in merged {
-        let mut i = start;
-        while i < end {
-            if speech[i] {
-                i += 1;
-                continue;
-            }
-            let s = i;
-            while i < end && !speech[i] {
-                i += 1;
-            }
-            out.push((s, i));
-        }
-    }
-
-    out
-}
-
-#[derive(Debug)]
-enum Action {
-    Keep,
-    Collapse { to_s: f64 },
-    Speed { factor: f64 },
-}
-
-fn decide(len_s: f64) -> Action {
-    if len_s < 1.0 {
-        Action::Keep
-    } else if len_s < 4.0 {
-        Action::Collapse { to_s: 0.50 }
-    } else {
-        let target = (len_s / 12.0).clamp(1.2, 6.0);
-        Action::Speed {
-            factor: (len_s / target).min(20.0),
-        }
-    }
-}
-
-#[derive(Debug, Serialize)]
-struct Segment {
-    src_start: f64,
-    src_end: f64,
-    speed: f64,
-}
-
-fn build_segments(runs: &[(usize, usize)], grid_len: usize, src_duration_s: f64) -> Vec<Segment> {
-    let mut segs = Vec::new();
-    let mut cursor = 0usize;
-
-    for &(start, end) in runs {
-        let len_s = (end - start) as f64 * GRID_S;
-        let action = decide(len_s);
-
-        if matches!(action, Action::Keep) {
-            continue;
-        }
-
-        // normal material before this run
-        if start > cursor {
-            segs.push(Segment {
-                src_start: cursor as f64 * GRID_S,
-                src_end: start as f64 * GRID_S,
-                speed: 1.0,
-            });
-        }
-
-        match action {
-            Action::Collapse { to_s } => segs.push(Segment {
-                src_start: start as f64 * GRID_S,
-                src_end: start as f64 * GRID_S + to_s,
-                speed: 1.0,
-            }),
-            Action::Speed { factor } => segs.push(Segment {
-                src_start: start as f64 * GRID_S,
-                src_end: end as f64 * GRID_S,
-                speed: factor,
-            }),
-            Action::Keep => unreachable!(),
-        }
-
-        cursor = end;
-    }
-
-    // tail
-    if cursor < grid_len {
-        segs.push(Segment {
-            src_start: cursor as f64 * GRID_S,
-            src_end: src_duration_s,
-            speed: 1.0,
-        });
-    }
-
-    segs
-}
-
-#[derive(Debug, Serialize)]
-struct PlanSegment {
-    src_start: f64,
-    src_end: f64,
-    speed: f64,
-    out_start: f64,
-    out_end: f64,
-}
-
-#[derive(Debug, Serialize)]
-struct Plan {
-    src_duration_s: f64,
-    out_duration_s: f64,
+/// M4b — pick the VAD threshold per video, no labels. Sweep a fixed set of
+/// thresholds, count sped-up sections for each (the metric is the *plan*, not
+/// the mask), and take the plateau: the flat minimum of the U-shaped count.
+/// Returns (chosen threshold, status label, the sweep table).
+///
+/// The VAD probabilities do not depend on the threshold, so only the speech
+/// mask and plan are rebuilt per threshold — the sweep is cheap.
+fn calibrate_threshold(
+    probs: &[f32],
+    frozen: &[bool],
+    energy_sm: &[f64],
     grid_len: usize,
-    crop: String,
-    segments: Vec<PlanSegment>,
-}
+) -> (f32, &'static str, Vec<(f32, f64, Vec<i64>)>) {
+    let candidates = [0.50f32, 0.40, 0.30, 0.25, 0.20, 0.15];
 
-fn merge_adjacent(segs: Vec<Segment>) -> Vec<Segment> {
-    let mut out: Vec<Segment> = vec![];
-
-    for s in segs {
-        match out.last_mut() {
-            Some(prev) if prev.speed == s.speed && (prev.src_end - s.src_start).abs() < 1e-9 => {
-                prev.src_end = s.src_end;
-            }
-            _ => out.push(s),
-        }
-    }
-
-    out
-}
-
-fn energy_db(samples: &[f32], sample_rate: u32) -> Vec<f64> {
-    let frame = (sample_rate as f64 * ENERGY_S) as usize; // 160 samples
-    let n = samples.len() / frame;
-    let mut out = Vec::with_capacity(n);
-
-    for i in 0..n {
-        let chunk = &samples[i * frame..(i + 1) * frame];
-        let sum: f64 = chunk.iter().map(|&s| (s as f64) * (s as f64)).sum();
-        let rms = (sum / frame as f64).sqrt();
-        out.push(20.0 * rms.max(1e-10).log10());
-    }
-
-    out
-}
-
-fn smooth(energy: &[f64], window_s: f64) -> Vec<f64> {
-    let mut k = (window_s / ENERGY_S) as usize; // 0.03 / 0.01 = 3
-    if k.is_multiple_of(2) {
-        k += 1; // must be odd, so there's a centre
-    }
-    let half = k / 2; // 1
-
-    let mut out = Vec::with_capacity(energy.len());
-
-    for i in 0..energy.len() {
-        let lo = i.saturating_sub(half); // one before, or 0 at the start
-        let hi = (i + half + 1).min(energy.len()); // one after, or the end
-        let sum: f64 = energy[lo..hi].iter().sum();
-        out.push(sum / (hi - lo) as f64); // average
-    }
-
-    out
-}
-
-fn trim_edges(runs: &[(usize, usize)], energy: &[f64], gate_db: f64) -> Vec<(usize, usize)> {
-    let max_shrink = (MAX_SHRINK_S / ENERGY_S) as usize; // 300 energy frames
-    let margin = (EDGE_MARGIN_S / ENERGY_S) as usize; // 15
-    let min_dead = (MIN_DEAD_S / ENERGY_S) as usize; // 100
-
-    let mut out = Vec::new();
-
-    for &(a_slice, b_slice) in runs {
-        // work in energy-frame indices
-        let a = a_slice * 2;
-        let b = (b_slice * 2).min(energy.len());
-
-        let mut start = a;
-        let mut end = b;
-
-        // leading edge: last loud frame in the first max_shrink frames
-        let window_end = (a + max_shrink).min(b);
-        let mut last_loud = None;
-        for i in a..window_end {
-            if energy[i] > gate_db {
-                last_loud = Some(i);
-            }
-        }
-        if let Some(i) = last_loud {
-            start = (i + margin).min(b - min_dead);
-        }
-
-        // trailing edge: first loud frame in the last max_shrink frames
-        let window_start = b.saturating_sub(max_shrink).max(start);
-        let mut first_loud = None;
-        for i in window_start..b {
-            if energy[i] > gate_db {
-                first_loud = Some(i);
-                break;
-            }
-        }
-        if let Some(i) = first_loud {
-            end = i.saturating_sub(margin).max(start + min_dead);
-        }
-
-        // back to grid slices — never drop
-        out.push((start / 2, (end / 2).min(b_slice)));
-    }
-
-    out
-}
-
-fn atempo_chain(speed: f64) -> String {
-    let mut parts = Vec::new();
-    let mut r = speed;
-
-    while r > ATEMPO_MAX {
-        parts.push(ATEMPO_MAX);
-        r /= ATEMPO_MAX;
-    }
-    parts.push(r);
-    parts
+    let table: Vec<(f32, f64, Vec<i64>)> = candidates
         .iter()
-        .map(|p| format!("atempo={p:.6}"))
-        .collect::<Vec<_>>()
-        .join(",")
-}
+        .map(|&t| {
+            let exit = (t - 0.15).max(0.01); // Silero's threshold - 0.15, floored
+            let mask = speech_mask(probs, t, exit, grid_len);
+            let speech_pct = 100.0 * mask.iter().filter(|&&b| b).count() as f64 / grid_len as f64;
+            (t, speech_pct, speedup_starts(&mask, frozen, energy_sm))
+        })
+        .collect();
 
-fn render_segments(input: &str, seg: &Segment, out_path: &Path) -> Result<()> {
-    let mut cmd = Command::new("ffmpeg");
+    let counts: Vec<usize> = table.iter().map(|(_, _, s)| s.len()).collect();
+    let min_count = *counts.iter().min().unwrap();
+    let max_count = *counts.iter().max().unwrap();
+    let spread = max_count - min_count;
 
-    cmd.args([
-        "-y",
-        "-ss",
-        &format!("{:.6}", seg.src_start),
-        "-to",
-        &format!("{:.6}", seg.src_end),
-        "-i",
-        input,
-    ]);
+    // candidates run high -> low, so the first index at the minimum is the
+    // highest (most conservative) threshold on the plateau.
+    let min_idx = counts.iter().position(|&c| c == min_count).unwrap();
+    let at_edge = min_idx == 0 || min_idx == candidates.len() - 1;
 
-    if seg.speed != 1.0 {
-        cmd.args(["-vf", &format!("setpts=PTS/{:.6}", seg.speed)]);
-        cmd.args(["-af", &format!("{},volume=0", atempo_chain(seg.speed))]);
+    // A tuner that cannot tell it is blind is worse than a constant.
+    if spread >= 2 {
+        (candidates[min_idx], "calibrated", table)
+    } else if spread == 1 && !at_edge {
+        (candidates[min_idx], "weak (provisional)", table)
+    } else {
+        (VAD_ENTER, "no signal — default", table)
     }
-
-    cmd.args([
-        "-c:v",
-        "libx264",
-        "-preset",
-        "fast",
-        "-crf",
-        "19",
-        "-profile:v",
-        "high",
-        "-pix_fmt",
-        "yuv420p",
-        "-g",
-        "120",
-        "-c:a",
-        "pcm_s16le",
-        "-ar",
-        "48000",
-        "-ac",
-        "2",
-    ]);
-    cmd.arg(out_path);
-
-    let out = cmd.output().context("could not run ffmpeg")?;
-    if !out.status.success() {
-        bail!(
-            "ffmpeg failed on segment: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    Ok(())
-}
-
-fn concat_segments(list_path: &Path, out_path: &Path) -> Result<()> {
-    let out = Command::new("ffmpeg")
-        .args(["-y", "-f", "concat", "-safe", "0", "-i"])
-        .arg(list_path)
-        .args(["-c", "copy"])
-        .arg(out_path)
-        .output()
-        .context("could not run ffmpeg")?;
-
-    if !out.status.success() {
-        bail!(
-            "concat failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-
-    Ok(())
-}
-
-fn finalize(concat_path: &Path, out_path: &Path) -> Result<()> {
-    let out = Command::new("ffmpeg")
-        .args(["-y", "-i"])
-        .arg(concat_path)
-        .args([
-            "-c:v",
-            "copy",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "192k",
-            "-movflags",
-            "+faststart",
-        ])
-        .arg(out_path)
-        .output()
-        .context("could not run ffmpeg")?;
-
-    if !out.status.success() {
-        bail!(
-            "Finalize failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-
-    Ok(())
-}
-
-fn master(input: &Path, out: &Path, compress: bool) -> Result<()> {
-    // The filters that run before loudnorm. loudnorm must be measured through
-    // exactly these, because this is the audio it will actually see.
-    let mut prefix = vec![
-        format!("highpass=f={HIGHPASS_HZ}"),
-        "afftdn=nr=12:nf=-45".to_string(),
-    ];
-    if compress {
-        prefix.push(COMPRESSOR.to_string());
-    }
-
-    // Pass 1: measure the file as loudnorm will see it.
-    let prefix_refs: Vec<&str> = prefix.iter().map(|s| s.as_str()).collect();
-    let stats = measure_loudnorm(
-        input.to_str().context("non-UTF-8 path")?,
-        &prefix_refs,
-        MASTER_LUFS,
-        MASTER_TP,
-        11.0,
-    )?;
-
-    // Pass 2: apply, feeding the measured values back so loudnorm normalises
-    // from full knowledge of the file instead of a live guess.
-    let loud = format!(
-        "loudnorm=I={MASTER_LUFS}:TP={MASTER_TP}:LRA=11:\
-measured_I={:.2}:measured_TP={:.2}:measured_LRA={:.2}:measured_thresh={:.2}:offset={:.2}:linear=true",
-        stats.input_i, stats.input_tp, stats.input_lra, stats.input_thresh, stats.target_offset
-    );
-    let mut parts = prefix;
-    parts.push(loud);
-    let filter = parts.join(",");
-
-    let o = Command::new("ffmpeg")
-        .args(["-y", "-i"])
-        .arg(input)
-        .args([
-            "-c:v",
-            "copy",
-            "-ar",
-            "48000",
-            "-ac",
-            "2",
-            "-af",
-            &filter,
-            "-c:a",
-            "pcm_s16le",
-        ])
-        .arg(out)
-        .output()
-        .context("could not run ffmpeg")?;
-
-    if !o.status.success() {
-        bail!(
-            "master failed: {}",
-            String::from_utf8_lossy(&o.stderr).trim()
-        );
-    }
-    Ok(())
-}
-
-#[derive(Debug)]
-struct Check {
-    name: &'static str,
-    passed: bool,
-    detail: String,
-}
-
-// ---------------------------------------------------------------- 5. faststart
-
-fn check_faststart(out_path: &Path) -> Result<Check> {
-    // read the first 64 KB and look for moov before mdat
-    let bytes = fs::read(out_path).context("could not read output")?;
-    let head = &bytes[..bytes.len().min(65536)];
-
-    let moov = find_atom(head, b"moov");
-    let mdat = find_atom(head, b"mdat");
-
-    let passed = match (moov, mdat) {
-        (Some(m), Some(d)) => m < d,
-        (Some(_), None) => true, // moov early, mdat past the window
-        _ => false,
-    };
-
-    Ok(Check {
-        name: "faststart",
-        passed,
-        detail: format!("moov at {moov:?}, mdat at {mdat:?}"),
-    })
-}
-
-fn find_atom(bytes: &[u8], tag: &[u8; 4]) -> Option<usize> {
-    bytes.windows(4).position(|w| w == tag)
-}
-
-// ----------------------------------------------------------------- 4. loudness
-
-fn check_loudness(out_path: &Path) -> Result<Check> {
-    let (i, tp) = measure_loudness(
-        out_path.to_str().context("non-UTF-8 path")?,
-        MASTER_LUFS,
-        &[],
-    )?;
-
-    let passed = (i - MASTER_LUFS).abs() <= 0.1 && tp <= MASTER_TP + 0.3;
-
-    Ok(Check {
-        name: "loudness",
-        passed,
-        detail: format!("{i:.2} LUFS, {tp:.2} dBTP"),
-    })
-}
-
-// ------------------------------------------------------------------ 2. a/v sync
-
-fn check_sync(input: &str, out_path: &Path, temp_dir: &Path, plan: &Plan) -> Result<Check> {
-    let n = 7;
-    let mut scores = Vec::new();
-
-    for k in 1..=n {
-        let out_t = plan.out_duration_s * k as f64 / (n + 1) as f64;
-        let src_t = match map_to_source(plan, out_t) {
-            Some(t) => t,
-            None => continue,
-        };
-
-        let a = temp_dir.join(format!("sync_out_{k}.png"));
-        let b = temp_dir.join(format!("sync_src_{k}.png"));
-
-        grab_frame(out_path.to_str().unwrap(), out_t, &a)?;
-        grab_frame(input, src_t, &b)?;
-
-        scores.push(ssim(&a, &b)?);
-    }
-
-    let worst = scores.iter().cloned().fold(1.0f64, f64::min);
-
-    Ok(Check {
-        name: "a/v sync",
-        passed: worst >= 0.90,
-        detail: format!("worst {worst:.3} over {} checkpoints", scores.len()),
-    })
-}
-
-fn map_to_source(plan: &Plan, out_t: f64) -> Option<f64> {
-    for s in &plan.segments {
-        if out_t >= s.out_start && out_t < s.out_end {
-            let into = out_t - s.out_start;
-            return Some(s.src_start + into * s.speed);
-        }
-    }
-    None
-}
-
-fn grab_frame(input: &str, t: f64, out_path: &Path) -> Result<()> {
-    let out = Command::new("ffmpeg")
-        .args([
-            "-y",
-            "-ss",
-            &format!("{t:.6}"),
-            "-i",
-            input,
-            "-frames:v",
-            "1",
-            "-q:v",
-            "2",
-        ])
-        .arg(out_path)
-        .output()
-        .context("could not run ffmpeg")?;
-
-    if !out.status.success() {
-        bail!(
-            "frame grab failed at {t:.2}s: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    Ok(())
-}
-
-fn ssim(a: &Path, b: &Path) -> Result<f64> {
-    let out = Command::new("ffmpeg")
-        .args(["-i"])
-        .arg(a)
-        .args(["-i"])
-        .arg(b)
-        .args(["-lavfi", "ssim", "-f", "null", "-"])
-        .output()
-        .context("could not run ffmpeg")?;
-
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    let all = stderr
-        .split("All:")
-        .nth(1)
-        .context("no SSIM in ffmpeg output")?;
-    let value = all.split_whitespace().next().context("bad SSIM output")?;
-    value.parse().context("could not parse SSIM")
-}
-
-fn read_wav(path: &Path) -> Result<(Vec<f32>, u32)> {
-    let reader =
-        WavReader::open(path).with_context(|| format!("could not open {}", path.display()))?;
-    let rate = reader.spec().sample_rate;
-    let samples: Vec<f32> = reader
-        .into_samples::<f32>()
-        .collect::<Result<Vec<f32>, _>>()?;
-    Ok((samples, rate))
-}
-
-fn extract_verify_audio(out_path: &Path, wav_path: &Path) -> Result<()> {
-    let out = Command::new("ffmpeg")
-        .args(["-y", "-i"])
-        .arg(out_path)
-        .args(["-vn", "-ac", "1", "-ar", "48000", "-c:a", "pcm_f32le"])
-        .arg(wav_path)
-        .output()
-        .context("could not run ffmpeg")?;
-
-    if !out.status.success() {
-        bail!(
-            "verify audio extraction failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    Ok(())
-}
-
-fn check_clicks(samples: &[f32], sample_rate: u32, plan: &Plan) -> Result<Check> {
-    let mut diffs: Vec<f32> = samples.windows(2).map(|w| (w[1] - w[0]).abs()).collect();
-    diffs.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let p999 = diffs[(diffs.len() as f64 * 0.999) as usize];
-
-    let mut worst = 0.0f32;
-    let mut failures = 0;
-
-    for seg in plan.segments.iter().skip(1) {
-        let idx = (seg.out_start * sample_rate as f64) as usize;
-        if idx == 0 || idx >= samples.len() {
-            continue;
-        }
-        let jump = (samples[idx] - samples[idx - 1]).abs();
-        worst = worst.max(jump);
-        if jump > p999 {
-            failures += 1;
-        }
-    }
-
-    Ok(Check {
-        name: "splice clicks",
-        passed: failures == 0,
-        detail: format!(
-            "{failures} / {} (worst {worst:.4} vs p99.9 {p999:.4})",
-            plan.segments.len() - 1
-        ),
-    })
-}
-
-// ---------------------------------------------------------- duration vs plan
-
-fn check_duration(out_path: &Path, plan: &Plan) -> Result<Check> {
-    let json = ffprobe_json(out_path.to_str().context("non-UTF-8 path")?)?;
-    let probe: Probe =
-        serde_json::from_str(&json).context("could not parse ffprobe output for out.mp4")?;
-    let measured: f64 = probe
-        .format
-        .duration
-        .parse()
-        .with_context(|| format!("bad out.mp4 duration {:?}", probe.format.duration))?;
-
-    let planned = plan.out_duration_s;
-    let diff = measured - planned;
-
-    Ok(Check {
-        name: "duration",
-        // sped segments round to whole frames, so the file runs a touch long.
-        // 0.5 s of slack per BUILD_STEPS M7; larger means the plan and the file
-        // genuinely disagree.
-        passed: diff.abs() <= 0.5,
-        detail: format!("{measured:.2}s vs plan {planned:.2}s ({diff:+.2}s)"),
-    })
-}
-
-fn verify(input: &str, out_path: &Path, temp_dir: &Path, plan: &Plan) -> Result<Vec<Check>> {
-    let mut checks = Vec::new();
-
-    // duration vs plan
-    checks.push(check_duration(out_path, plan)?);
-
-    // 5. faststart
-    checks.push(check_faststart(out_path)?);
-
-    // 4. loudness
-    checks.push(check_loudness(out_path)?);
-
-    // extract the delivered audio once — 1 and 2 both read it
-    let verify_wav = temp_dir.join("verify.wav");
-    extract_verify_audio(out_path, &verify_wav)?;
-    let (samples, rate) = read_wav(&verify_wav)?;
-
-    // 1. splice clicks
-    checks.push(check_clicks(&samples, rate, plan)?);
-
-    // 2. a/v sync
-    checks.push(check_sync(input, out_path, temp_dir, plan)?);
-
-    Ok(checks)
 }
 
 #[deny(unused_must_use)]
@@ -1008,6 +386,28 @@ fn main() -> Result<()> {
         "  >= {GATE_DB:.1}  {loud}  ({:.1}%)",
         100.0 * loud as f64 / n
     );
+
+    // M4b — calibrate the VAD threshold from the plan, then rebuild the speech
+    // mask if the choice differs from the default it was first built at.
+    let (chosen, status, table) = calibrate_threshold(&probs, &frozen, &energy_sm, grid_len);
+    println!("\nthreshold sweep:");
+    for (t, pct, starts) in &table {
+        println!(
+            "  {t:.2}  speech {pct:.1}%  {} sped-up  {starts:?}",
+            starts.len()
+        );
+    }
+    println!("chosen      {chosen:.2}  ({status})");
+
+    let padded = if (chosen - VAD_ENTER).abs() > 1e-6 {
+        let exit = (chosen - 0.15).max(0.01);
+        let padded = speech_mask(&probs, chosen, exit, grid_len);
+        let pct = 100.0 * padded.iter().filter(|&&b| b).count() as f64 / grid_len as f64;
+        println!("recalibrated speech {pct:.1}% (default was {VAD_ENTER:.2})");
+        padded
+    } else {
+        padded
+    };
 
     let runs = dead_runs(&padded, &frozen);
     println!("dead runs   {} raw", runs.len());

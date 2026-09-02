@@ -2,10 +2,11 @@
 
 State as of the end of the M7 session. Everything through M7 is built and
 verified against two real videos — all five verification checks pass on both.
-Four things were done in the follow-up session: the word-clip check was
-removed, mastering became two-pass, the duration check was added, and M8 landed
-as a one-line pre-flight verdict (no separate command). See the notes under
-**M7** / **M8** and the resolved items under **Open issues**.
+Five things were done in the follow-up session: the word-clip check was
+removed, mastering became two-pass, the duration check was added, M8 landed as a
+one-line pre-flight verdict (no separate command), and M4-M7 was split out of
+`main.rs` into modules (`plan`/`features`/`render`/`master`/`verify`). See the
+notes under **M7** / **M8** and the resolved items under **Open issues**.
 
 This document records what was built, what was *decided and why*, and what the
 measured numbers were. The reasoning matters more than the code: several
@@ -31,27 +32,36 @@ The prompt is parsed into the CLI struct but **not yet used**. Policy parsing
 
 ```
 src/
-  main.rs        orchestration + all M4-M7 logic (not yet split out)
+  main.rs        orchestration only (imports + main); ~500 lines
   lib.rs         module declarations
   constants.rs   every threshold, documented, with the evidence behind it
   cli.rs         the three inputs
   probe.rs       ffprobe, Probe/Format/Stream structs, parse_fps
   audio.rs       measure_loudness, measure_loudnorm (two-pass stats),
                  extract_audio, Loudnorm, LoudnormStats, Analysis
+  features.rs    energy_db, smooth
   vad.rs         hysteresis, bridge, drop_bursts, pad, longest_silences
   crop.rs        sample_frames, cell_activity, content_mask, blobs,
                  bounding_box, busy_fraction
   freeze.rs      detect_freezes, paint_freezes
+  plan.rs        dead_runs, bridge_dead, decide, build_segments,
+                 merge_adjacent, trim_edges, Segment/PlanSegment/Plan,
+                 map_to_source (the time map)
+  render.rs      atempo_chain, render_segments, concat_segments
+  master.rs      master (two-pass loudnorm), finalize
+  verify.rs      Check + the five checks (duration, faststart, loudness,
+                 splice clicks, a/v sync)
   utilities.rs   fmt_time
 ```
 
 `main.rs` and `lib.rs` are **separate crates**. `main.rs` uses `elide::module::item`,
 never `mod`. Modules inside the library use `crate::`.
 
-M4-M7 code (planner, render, master, verify) still lives in `main.rs` and has
-not been split into `plan.rs` / `render.rs` / `master.rs` / `verify.rs`. That
-split is deliberate deferred work, not an oversight — the shape was still
-moving.
+M4-M7 code was split out into `plan.rs` / `features.rs` / `render.rs` /
+`master.rs` / `verify.rs` (follow-up session). The split was verified
+behaviour-preserving: both test files produce identical numbers and all five
+checks pass, before and after. `plan.rs` is the centre — it owns the `Plan`
+struct and the `map_to_source` time map that verify (and M9 captions) read.
 
 ---
 
@@ -536,10 +546,11 @@ fallback when Ollama is unreachable — is entirely unbuilt.
 `master.mkv`, PNG frames from the sync check. Keeping the WAV was a deliberate
 choice (open it in Audacity when a mask looks wrong). The rest is undecided.
 
-### 7. `main.rs` has not been split
+### 7. `main.rs` split — RESOLVED
 
-M4-M7 logic all lives there. `FLOW_SPEC.md`'s suggested split names `plan`,
-`render`, `master`, `verify` as separate modules.
+Done in the follow-up session. `plan`, `features`, `render`, `master`, `verify`
+are now separate modules; `main.rs` is imports + `main()` only. Verified
+behaviour-identical on both test files (same numbers, all five checks pass).
 
 ---
 
