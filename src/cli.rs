@@ -14,4 +14,9 @@ pub struct Cli {
     /// prompt like "This video is a demo of my application called brainclean"
     #[arg(short, long)]
     pub prompt: String,
+
+    /// optional word-level transcript (JSON: [{text,start,end,prob}]) to build
+    /// captions.srt, re-timed through the edit
+    #[arg(long)]
+    pub transcript: Option<String>,
 }

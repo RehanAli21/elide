@@ -6,6 +6,7 @@ use anyhow::{bail, Context, Result};
 use clap::Parser;
 
 use elide::audio::{extract_audio, measure_loudness, Analysis};
+use elide::captions::{write_srt, Word};
 use elide::cli::Cli;
 use elide::constants::{
     ACTIVITY_MIN, BRIDGE_GAP_S, DEAD_BRIDGE_S, GATE_DB, GRID_H, GRID_S, GRID_W, HIGHPASS_HZ,
@@ -557,6 +558,23 @@ fn main() -> Result<()> {
     let out_path = PathBuf::from(&args.output).join("out.mp4");
     finalize(&master_path, &out_path)?;
     println!("wrote       {}", out_path.display());
+
+    // M9 — captions, scaled to the real output duration (fixes the drift)
+    if let Some(tpath) = &args.transcript {
+        let out_json = ffprobe_json(out_path.to_str().context("non-UTF-8 path")?)?;
+        let out_probe: Probe = serde_json::from_str(&out_json)
+            .context("could not parse ffprobe output for out.mp4")?;
+        let measured: f64 = out_probe.format.duration.parse().context("bad out.mp4 duration")?;
+        let scale = measured / plan.out_duration_s;
+
+        let raw = fs::read_to_string(tpath)
+            .with_context(|| format!("could not read transcript {tpath}"))?;
+        let words: Vec<Word> =
+            serde_json::from_str(&raw).context("could not parse transcript JSON")?;
+        let srt_path = PathBuf::from(&args.output).join("captions.srt");
+        let n = write_srt(&words, &plan, scale, &srt_path)?;
+        println!("captions    {n} cues -> {} (scale {scale:.5})", srt_path.display());
+    }
 
     let checks = verify(&args.input, &out_path, &temp_dir, &plan)?;
 

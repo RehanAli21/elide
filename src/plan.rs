@@ -251,8 +251,7 @@ pub fn count_speedups(speech: &[bool], frozen: &[bool], energy_sm: &[f64]) -> us
 }
 
 /// The time map: given an output timestamp, the source timestamp that plays
-/// there. `check_sync` (verify) and captions (M9) both read backwards through
-/// this.
+/// there. `check_sync` (verify) reads backwards through this.
 pub fn map_to_source(plan: &Plan, out_t: f64) -> Option<f64> {
     for s in &plan.segments {
         if out_t >= s.out_start && out_t < s.out_end {
@@ -261,4 +260,20 @@ pub fn map_to_source(plan: &Plan, out_t: f64) -> Option<f64> {
         }
     }
     None
+}
+
+/// The inverse time map: given a SOURCE timestamp, the OUTPUT timestamp where it
+/// plays. A source time that fell in removed material snaps forward to the next
+/// kept segment's start. Captions (M9) push every word timing through this.
+/// Mirrors the Python reference `remap`.
+pub fn map_to_output(plan: &Plan, src_t: f64) -> f64 {
+    for s in &plan.segments {
+        if src_t < s.src_start {
+            return s.out_start;
+        }
+        if src_t <= s.src_end {
+            return s.out_start + (src_t - s.src_start) / s.speed;
+        }
+    }
+    plan.out_duration_s
 }
