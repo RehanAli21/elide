@@ -53,7 +53,17 @@ fn check_loudness(out_path: &Path) -> Result<Check> {
         &[],
     )?;
 
-    let passed = (i - MASTER_LUFS).abs() <= 0.1 && tp <= MASTER_TP + 0.3;
+    // +/-0.2 LUFS per BUILD_STEPS M7's acceptance criterion. It was 0.1 here,
+    // taken from M6's prose describing a typical range rather than the
+    // criterion — and 0.1 rejects the reference's own deliverables:
+    //   demonstration_v6  -13.92  dev 0.08  passes
+    //   extension_v6      -14.17  dev 0.17  FAILS
+    // A threshold that rejects the artifact it was written to describe is wrong.
+    // Single-pass dynamic loudnorm lands across a ~0.25 LUFS range in practice.
+    //
+    // The true-peak limit stays where it is: AAC is the last thing to touch the
+    // signal, and the reference clears -1.2 with 0.15-0.20 dB to spare.
+    let passed = (i - MASTER_LUFS).abs() <= 0.2 && tp <= MASTER_TP + 0.3;
 
     Ok(Check {
         name: "loudness",
@@ -166,7 +176,8 @@ fn extract_verify_audio(out_path: &Path, wav_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn check_clicks(samples: &[f32], sample_rate: u32, plan: &Plan) -> Result<Check> {
+/// Sample-to-sample jump at each splice, against the file's own p99.9.
+fn click_stats(samples: &[f32], sample_rate: u32, plan: &Plan) -> (usize, f32, f32) {
     let mut diffs: Vec<f32> = samples.windows(2).map(|w| (w[1] - w[0]).abs()).collect();
     diffs.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let p999 = diffs[(diffs.len() as f64 * 0.999) as usize];
@@ -186,13 +197,39 @@ fn check_clicks(samples: &[f32], sample_rate: u32, plan: &Plan) -> Result<Check>
         }
     }
 
+    (failures, worst, p999)
+}
+
+/// `pre` is the same measurement on the pre-master concat, before the limiter
+/// touches the signal.
+///
+/// The limiter smooths transients, which makes this check easier to pass —
+/// measured 0.0443 -> 0.0334 on the demo. A check that got easier because we
+/// changed the signal is not the same as a check that passed on merit, so the
+/// pre-limiter number is reported alongside rather than quietly banked.
+fn check_clicks(
+    samples: &[f32],
+    sample_rate: u32,
+    plan: &Plan,
+    pre: Option<(&[f32], u32)>,
+) -> Result<Check> {
+    let (failures, worst, p999) = click_stats(samples, sample_rate, plan);
+    let n = plan.segments.len() - 1;
+
+    let detail = match pre {
+        Some((ps, pr)) => {
+            let (_, pre_worst, _) = click_stats(ps, pr, plan);
+            format!(
+                "{failures} / {n} (worst {worst:.4} vs p99.9 {p999:.4}; pre-limiter worst {pre_worst:.4})"
+            )
+        }
+        None => format!("{failures} / {n} (worst {worst:.4} vs p99.9 {p999:.4})"),
+    };
+
     Ok(Check {
         name: "splice clicks",
         passed: failures == 0,
-        detail: format!(
-            "{failures} / {} (worst {worst:.4} vs p99.9 {p999:.4})",
-            plan.segments.len() - 1
-        ),
+        detail,
     })
 }
 
@@ -238,8 +275,22 @@ pub fn verify(input: &str, out_path: &Path, temp_dir: &Path, plan: &Plan) -> Res
     extract_verify_audio(out_path, &verify_wav)?;
     let (samples, rate) = read_wav(&verify_wav)?;
 
-    // 1. splice clicks
-    checks.push(check_clicks(&samples, rate, plan)?);
+    // 1. splice clicks — also measured on the pre-master concat, so the
+    // limiter's smoothing of transients is visible rather than banked
+    let concat_path = temp_dir.join("concat.mkv");
+    let pre = if concat_path.exists() {
+        let pre_wav = temp_dir.join("verify_pre.wav");
+        extract_verify_audio(&concat_path, &pre_wav)?;
+        Some(read_wav(&pre_wav)?)
+    } else {
+        None
+    };
+    checks.push(check_clicks(
+        &samples,
+        rate,
+        plan,
+        pre.as_ref().map(|(s, r)| (s.as_slice(), *r)),
+    )?);
 
     // 2. a/v sync
     checks.push(check_sync(input, out_path, temp_dir, plan)?);

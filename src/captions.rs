@@ -11,12 +11,12 @@ use std::fs;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::plan::{map_to_output, Plan};
 
 /// One word from the transcript JSON (source-timed).
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct Word {
     pub text: String,
     pub start: f64,

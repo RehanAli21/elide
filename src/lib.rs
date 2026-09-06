@@ -1,8 +1,11 @@
+pub mod align;
 pub mod audio;
 pub mod captions;
 pub mod cli;
 pub mod constants;
 pub mod crop;
+pub mod disfluency;
+pub mod dsp;
 pub mod features;
 pub mod freeze;
 pub mod master;

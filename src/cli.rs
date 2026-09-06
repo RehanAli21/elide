@@ -15,8 +15,8 @@ pub struct Cli {
     #[arg(short, long)]
     pub prompt: String,
 
-    /// optional word-level transcript (JSON: [{text,start,end,prob}]) to build
-    /// captions.srt, re-timed through the edit
+    /// optional word-level transcript (JSON: [{text,start,end,prob}]) to use
+    /// instead of running whisper — a debugging override
     #[arg(long)]
     pub transcript: Option<String>,
 }

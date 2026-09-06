@@ -5,16 +5,18 @@ use std::time::Instant;
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 
+use elide::align::{ensure_model, transcribe_chunked};
 use elide::audio::{extract_audio, measure_loudness, Analysis};
 use elide::captions::{write_srt, Word};
 use elide::cli::Cli;
 use elide::constants::{
-    ACTIVITY_MIN, BRIDGE_GAP_S, DEAD_BRIDGE_S, GATE_DB, GRID_H, GRID_S, GRID_W, HIGHPASS_HZ,
+    ACTIVITY_MIN, BRIDGE_GAP_S, DEAD_BRIDGE_S, EDGE_SMOOTH_S, ENERGY_S, GATE_DB, GRID_H, GRID_S, GRID_W, HIGHPASS_HZ,
     MASTER_LUFS, MASTER_TP, MAX_BUSY, MIN_BLOB, MIN_DEAD_S, MIN_SPEECH_S, PAD_AFTER_S, PAD_BEFORE_S,
     QUIET_DB, SAMPLES_PER_SLICE, SAMPLE_RATE, TARGET_LUFS, VAD_CHUNK, VAD_ENTER, VAD_EXIT,
 };
 use elide::crop::{blobs, bounding_box, busy_fraction, cell_activity, content_mask, sample_frames};
-use elide::features::{energy_db, smooth};
+use elide::disfluency::{apply_cuts, find_cuts};
+use elide::features::{boxcar, energy_db, smooth};
 use elide::freeze::{detect_freezes, paint_freezes};
 use elide::master::{finalize, master};
 use elide::plan::{
@@ -169,6 +171,30 @@ fn main() -> Result<()> {
     let path = temp_dir.join("analysis.json");
     fs::write(&path, serde_json::to_string_pretty(&analysis)?)
         .with_context(|| format!("could not write {}", path.display()))?;
+
+    // transcript for captions (and, later, disfluency). A supplied --transcript
+    // overrides; otherwise we transcribe with chunked whisper.
+    let words: Vec<Word> = if let Some(tpath) = &args.transcript {
+        let raw = fs::read_to_string(tpath)
+            .with_context(|| format!("could not read transcript {tpath}"))?;
+        serde_json::from_str(&raw).context("could not parse transcript JSON")?
+    } else {
+        let model = ensure_model()?;
+        println!("transcribing (chunked whisper)...");
+        let t0 = Instant::now();
+        let w = transcribe_chunked(&samples, spec.sample_rate, &model)?;
+        println!(
+            "transcript  {} words in {:.1}s",
+            w.len(),
+            t0.elapsed().as_secs_f64()
+        );
+        w
+    };
+
+    // keep the transcript so a re-run can skip whisper via --transcript
+    let tpath = temp_dir.join("transcript.json");
+    fs::write(&tpath, serde_json::to_string_pretty(&words)?)
+        .with_context(|| format!("could not write {}", tpath.display()))?;
 
     let mut vad = VoiceActivityDetector::builder()
         .sample_rate(SAMPLE_RATE)
@@ -360,7 +386,10 @@ fn main() -> Result<()> {
         grid_len * 2
     );
 
+    // Two smoothings, one per job. 30 ms for the disfluency splice test and the
+    // quiet-run guard; 100 ms for the edge guard, so a mouse click cannot trip it.
     let energy_sm = smooth(&energy, 0.03);
+    let energy_edge = boxcar(&energy, (EDGE_SMOOTH_S / ENERGY_S) as usize);
     println!(
         "smooth energy      {} frames (grid_len x2 = {})",
         energy_sm.len(),
@@ -390,7 +419,7 @@ fn main() -> Result<()> {
 
     // M4b — calibrate the VAD threshold from the plan, then rebuild the speech
     // mask if the choice differs from the default it was first built at.
-    let (chosen, status, table) = calibrate_threshold(&probs, &frozen, &energy_sm, grid_len);
+    let (chosen, status, table) = calibrate_threshold(&probs, &frozen, &energy_edge, grid_len);
     println!("\nthreshold sweep:");
     for (t, pct, starts) in &table {
         println!(
@@ -424,7 +453,7 @@ fn main() -> Result<()> {
     println!("            {} after min_dead filter", runs.len());
 
     let before: usize = runs.iter().map(|&(a, b)| b - a).sum();
-    let runs = trim_edges(&runs, &energy_sm, GATE_DB);
+    let runs = trim_edges(&runs, &energy_edge, GATE_DB);
     let after: usize = runs.iter().map(|&(a, b)| b - a).sum();
     println!(
         "            {} after edge guard, {:.1}s trimmed",
@@ -464,6 +493,70 @@ fn main() -> Result<()> {
 
     let segs = build_segments(&runs, grid_len, duration);
     let segs = merge_adjacent(segs);
+
+    // M11 — disfluency cuts, subtracted from the 1x segments only
+    let (cuts, rejected, clipped) = find_cuts(&words, &samples, spec.sample_rate, &energy_sm, &energy_edge, &segs);
+    let cut_s: f64 = cuts.iter().map(|c| c.end - c.start).sum();
+    let fillers = cuts.iter().filter(|c| c.kind == "filler").count();
+    let stutters = cuts.iter().filter(|c| c.kind == "stutter").count();
+    let repeats = cuts.iter().filter(|c| c.kind == "repeat").count();
+    println!(
+        "disfluency  {} cuts ({fillers} filler, {stutters} stutter, {repeats} repeat), {cut_s:.1}s removed, {} rejected",
+        cuts.len(),
+        rejected.len()
+    );
+    // repeats the rule found but the audio would not allow a cut at
+    if clipped > 0 {
+        println!("  clipped     {clipped}  (repeat found, no alignment passed)");
+    }
+    // proposed vs accepted per kind — separates "the detector found few" from
+    // "the gates threw many away"
+    // seconds per kind, not just counts — the gap has repeatedly turned out to
+    // be cut length rather than cut count.
+    // Reference (v6): filler ~26 / ~17.4s / avg 0.67s, repeat 9 / ~40.5s / avg 4.5s
+    for kind in ["filler", "stutter", "repeat"] {
+        let ok = cuts.iter().filter(|c| c.kind == kind).count();
+        let no = rejected.iter().filter(|r| r.kind == kind).count();
+        let secs: f64 = cuts
+            .iter()
+            .filter(|c| c.kind == kind)
+            .map(|c| c.end - c.start)
+            .sum();
+        let avg = if ok > 0 { secs / ok as f64 } else { 0.0 };
+        println!(
+            "  {kind:8}    {ok} accepted of {:2} proposed, {secs:5.1}s  avg {avg:.2}s",
+            ok + no
+        );
+    }
+    // per-chain detail for repeats: 2-take chains everywhere means the chain is
+    // truncating, which shows up as more repeats each shorter than the reference
+    for c in cuts.iter().filter(|c| c.kind == "repeat") {
+        println!(
+            "    {}  {} takes  span {:5.2}s  {:13}  sim {:.2}  {:?}",
+            fmt_time(c.start),
+            c.takes,
+            c.end - c.start,
+            c.align,
+            c.sim,
+            c.text
+        );
+    }
+    // why candidates died — the first word of each reason, counted
+    let mut why_counts: Vec<(String, usize)> = Vec::new();
+    for r in &rejected {
+        let key = r.why.split_whitespace().next().unwrap_or("?").to_string();
+        match why_counts.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, n)) => *n += 1,
+            None => why_counts.push((key, 1)),
+        }
+    }
+    for (why, n) in &why_counts {
+        println!("  rejected {n:3}  {why}");
+    }
+    for r in rejected.iter().take(8) {
+        println!("    {:8.2} {:8} {}", r.start, r.kind, r.why);
+    }
+    let segs = apply_cuts(segs, &cuts);
 
     let out_len: f64 = segs
         .iter()
@@ -560,21 +653,22 @@ fn main() -> Result<()> {
     println!("wrote       {}", out_path.display());
 
     // M9 — captions, scaled to the real output duration (fixes the drift)
-    if let Some(tpath) = &args.transcript {
-        let out_json = ffprobe_json(out_path.to_str().context("non-UTF-8 path")?)?;
-        let out_probe: Probe = serde_json::from_str(&out_json)
-            .context("could not parse ffprobe output for out.mp4")?;
-        let measured: f64 = out_probe.format.duration.parse().context("bad out.mp4 duration")?;
-        let scale = measured / plan.out_duration_s;
+    let out_json = ffprobe_json(out_path.to_str().context("non-UTF-8 path")?)?;
+    let out_probe: Probe =
+        serde_json::from_str(&out_json).context("could not parse ffprobe output for out.mp4")?;
+    let measured: f64 = out_probe
+        .format
+        .duration
+        .parse()
+        .context("bad out.mp4 duration")?;
+    let scale = measured / plan.out_duration_s;
 
-        let raw = fs::read_to_string(tpath)
-            .with_context(|| format!("could not read transcript {tpath}"))?;
-        let words: Vec<Word> =
-            serde_json::from_str(&raw).context("could not parse transcript JSON")?;
-        let srt_path = PathBuf::from(&args.output).join("captions.srt");
-        let n = write_srt(&words, &plan, scale, &srt_path)?;
-        println!("captions    {n} cues -> {} (scale {scale:.5})", srt_path.display());
-    }
+    let srt_path = PathBuf::from(&args.output).join("captions.srt");
+    let n = write_srt(&words, &plan, scale, &srt_path)?;
+    println!(
+        "captions    {n} cues -> {} (scale {scale:.5})",
+        srt_path.display()
+    );
 
     let checks = verify(&args.input, &out_path, &temp_dir, &plan)?;
 

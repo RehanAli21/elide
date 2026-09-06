@@ -2,11 +2,16 @@
 
 State as of the end of the M7 session. Everything through M7 is built and
 verified against two real videos — all five verification checks pass on both.
-Five things were done in the follow-up session: the word-clip check was
-removed, mastering became two-pass, the duration check was added, M8 landed as a
-one-line pre-flight verdict (no separate command), and M4-M7 was split out of
-`main.rs` into modules (`plan`/`features`/`render`/`master`/`verify`). See the
-notes under **M7** / **M8** and the resolved items under **Open issues**.
+Since then (follow-up sessions), in order: the word-clip check was removed,
+mastering became two-pass, the duration check was added, M8 landed as a one-line
+pre-flight verdict, M4-M7 was split out of `main.rs` into modules, M4b threshold
+calibration was built (reads "no signal" on both files), M5b parallel render was
+built and then **removed** (no material speedup — each ffmpeg already saturates
+the cores), chunked Whisper word alignment was built, then **M9 captions** and
+**M11 disfluency removal**. M10 was deliberately skipped until there is a GUI.
+
+The pipeline now runs end to end with no outside files: it transcribes itself,
+cuts dead air *and* disfluencies, masters, writes captions, and verifies.
 
 This document records what was built, what was *decided and why*, and what the
 measured numbers were. The reasoning matters more than the code: several
@@ -40,6 +45,11 @@ src/
   audio.rs       measure_loudness, measure_loudnorm (two-pass stats),
                  extract_audio, Loudnorm, LoudnormStats, Analysis
   features.rs    energy_db, smooth
+  align.rs       ensure_model (downloads to models/), transcribe_chunked
+  captions.rs    Word, write_srt (SRT re-timed through the plan)
+  disfluency.rs  find_cuts (filler/stutter/repeat/false-start + gates),
+                 apply_cuts
+  dsp.rs         radix-2 FFT, band spectra, similarity (no FFT crate)
   vad.rs         hysteresis, bridge, drop_bursts, pad, longest_silences
   crop.rs        sample_frames, cell_activity, content_mask, blobs,
                  bounding_box, busy_fraction
@@ -422,6 +432,104 @@ verdict     little to cut — probably not worth it  (2s removable, 2.4%)  # ext
 
 ---
 
+### M4b — threshold calibration (built; reads "no signal" on both files)
+
+Sweeps `0.50 … 0.15`, rebuilds the speech mask and plan for each, and compares
+the **sped-up section list**. The plateau (flat minimum of the U-shaped count)
+is the stable threshold; otherwise it falls back to 0.30 **and says so**.
+
+Cheap here: the VAD *probabilities* do not depend on the threshold, so only
+`vad::speech_mask` + the plan are rebuilt — no extra VAD passes.
+
+**On both our files it finds no signal**, so it picks the 0.30 default and the
+edit is unchanged. Measured on the demo:
+
+```
+  0.50  speech 62.3%  5 sped-up  [460, 639, 703, 794, 1021]
+  0.30  speech 68.0%  5 sped-up  [460, 639, 709, 794, 1021]
+  0.15  speech 72.0%  5 sped-up  [460, 639, 716, 794, 1023]
+```
+
+The mask *does* move (62.3% → 72.0%), but the same 5 sections are sped up at
+every threshold — only one start drifts a few seconds. The spec's demo showed
+spread 6 (counts 7,7,6,6,7,12) because a borderline quiet phrase flipped in and
+out of being sped up at high thresholds. **Our pipeline never produces that
+spurious speed-up at any threshold** — it protects that region consistently. So
+there is genuinely nothing to calibrate here; this is a real difference from the
+Python, not a bug. Kept anyway: it is correct, honest, and nearly free.
+
+### M9 — captions
+
+`--transcript` is an optional override; otherwise the tool transcribes itself.
+Words → cues (split at sentence ends) → every timing pushed through
+`plan::map_to_output` → sentence/clause line-breaking → time shared by character
+count → minimum `chars/18` reading time → wrap 44 x 2 → `out/captions.srt`.
+
+**Cues are scaled to the *measured* output duration**, not the plan's. The
+render runs slightly long (sped segments round to whole frames), so without this
+captions drift progressively late. `scale = measured / planned` ≈ 1.0002.
+
+**The text is raw ASR and reads badly.** Correcting it against on-screen
+evidence is the AI layer, not M9. Note the reference `srt.py` has its clean text
+**hand-written** as a list of 114 corrected sentences — it only uses the ASR for
+*timing*. So the reference SRT is not something an automated M9 can reproduce;
+what M9 guarantees is timing and structure. Chapters are deferred (the spec
+never says how a chapter boundary is chosen).
+
+### M10 — revision loop: deliberately skipped
+
+It only pays off behind a GUI where a user clicks to undo a cut. No GUI exists,
+and CLI edit commands would be clunky. Decision: build it with the GUI, so it
+fits what the GUI actually needs.
+
+### Word alignment — chunked Whisper (M11's prerequisite)
+
+`whisper-rs` + `models/ggml-base.bin`, downloaded on first run (`models/` is
+gitignored). Runs on the existing 16 kHz analysis audio.
+
+**Chunked, not one pass.** Whisper collapses repeated phrases when decoding a
+long file — its sliding window judges the repeat redundant, erasing exactly what
+disfluency detection hunts for. So: 30 s chunks, 3 s overlap, `no_context` on,
+and a word is kept only if its **midpoint** falls in the chunk's own region.
+Measured 1929 words on the demo against the Python chunked pass's 1893.
+
+**Suppress whisper.cpp's logging** with `whisper_rs::install_logging_hooks()`.
+Without it the run log was 599 KB of spam — and the printing itself was most of
+the cost: transcription dropped from 110 s to 24 s on the extension once
+silenced.
+
+Whisper-rs gives *token* timestamps, not words, so tokens are grouped into words
+on the leading-space convention (Whisper's own).
+
+### M11 — disfluency removal
+
+**WHAT to cut comes from the words. WHERE to cut comes from the waveform.**
+
+Four detectors: fillers, stutters, repeated phrases (cut first→**last**, keeping
+only the final take, longest match claiming its span first), and extended false
+starts. Every candidate then passes:
+
+```
+duration in [0.22, 3.20]  (9.5 for false starts)
+similarity >= 0.55 (repeats) / 0.35 (false starts)
+both splice points quieter than QUIET_DB
+QUIET-RUN GUARD: >= 0.10 s of contiguous quiet at each splice
+wholly inside a 1x segment — never inside a speed-up
+```
+
+**The snap windows must not be allowed to cross.** `SNAP_S` is 0.35 s but a
+filler is often shorter than that, so searching ±0.35 s around each end found
+the *same* quiet frame and the cut collapsed to zero length — 15 of 23
+candidates died as "duration 0.00s". Fix: each end searches only its own half of
+the cut. Cuts went 3 → 7 immediately. (The Python hit this too and dodged it
+with a tight 0.12 s window; we keep the 0.35 guard and bound the search instead.)
+
+**The similarity test needs a spectrum**, so `dsp.rs` carries a small radix-2
+FFT rather than pulling in an FFT crate.
+
+Expect most candidates to be rejected — that is the system working. On the demo:
+17 accepted, 21 rejected (10 quiet-run, 6 duration, 3 splice, 2 not-in-1x).
+
 ## Measured results
 
 ### brainclean_demonstration.mp4 (1170.10 s, 1920x1080@60, −30.22 LUFS)
@@ -441,14 +549,24 @@ dead runs       99 raw -> 92 bridged -> 22 filtered -> 22 trimmed (43.5 s)
 segments        28
 output          925.1 s (20.9% removed)
 render          ~340-380 s
-master_i        -29.95 LUFS   master_tp -9.09 dBTP   gain +15.95   compressor yes
-final           -14.00 LUFS, -1.40 dBTP        (two-pass; was -13.91 single-pass)
+transcript      1929 words (chunked whisper)   Python chunked pass: 1893
+disfluency      17 cuts (5 filler, 2 stutter, 10 repeat/false-start), 23.2 s
+                21 rejected: 10 quiet-run, 6 duration, 3 splice, 2 not-in-1x
+segments        45
+output          901.9 s (22.9% removed)
+captions        182 cues
+master_i        -29.94 LUFS   master_tp -9.09 dBTP   gain +15.94   compressor yes
+final           -13.99 LUFS, -1.35 dBTP
 ```
 
-Verification (all PASS): duration 925.22 s vs plan 925.06 s (**+0.16 s**),
-faststart, loudness −14.00 LUFS, splice clicks **0 / 27** (worst 0.0434 vs
-p99.9 0.1087), a/v sync **worst 0.991 over 7** (v6 was 0.980–0.993 with one
-outlier at 0.928).
+Verification (all PASS): duration 902.08 s vs plan 901.88 s (**+0.20 s**),
+faststart, loudness −13.99 LUFS, splice clicks **0 / 44** (worst 0.0433 vs
+p99.9 0.1087), a/v sync **worst 0.986 over 7**.
+
+**0 clicks at 44 splices, 17 of them inside speech**, is the evidence that
+cutting inside speech is safe here.
+
+Before M11 the same file gave 28 segments / 925.1 s / 0 clicks at 27 splices.
 
 ### brainclean_extension.mp4 (86.77 s, 1920x1080@60, −24.04 LUFS)
 
@@ -471,6 +589,12 @@ faststart, loudness −14.06 LUFS, splice clicks **0 / 1** (worst 0.0003 vs
 p99.9 0.2068), a/v sync **worst 0.999 over 7**. Before two-pass mastering this
 file **failed loudness at −14.16** and the export was refused — that genuine
 failure is also what proved a failed check blocks the export.
+
+Transcript 201 words; 18 caption cues. **0 disfluency cuts** — 2 candidates
+proposed, both rejected because the splice points were far too loud (−38 dB,
+−41 dB). Correct: this file is 97.6% continuous speech with almost no gaps to
+cut at. The threshold sweep is flat here too (0 sped-up sections at every
+threshold), so calibration reports no signal and uses 0.30.
 
 **Python v6 reference produced 86.00 s from this file (0.9% removed).** Two
 independent implementations reaching the same conclusion on a file with
@@ -507,16 +631,20 @@ removed. See the M7 section for the full reasoning.
 ### 2. Gap to the Python reference
 
 ```
-                Rust M4/M5      Python v6      gap
-demonstration     925.1 s         845.7 s      79.4 s
+                Rust            Python v6      gap
+demonstration     901.9 s         845.7 s      56.2 s
 extension          86.3 s          86.00 s      0.3 s
 ```
 
-The extension is effectively exact. The demonstration is ~79 s short of the
-reference. Roughly 40 s of that is the disfluency stage (v6 had 35 speech cuts,
-9 of them repeats), which is **unbuilt** — that's M11 (word alignment) and M13
-(disfluency removal). The remaining ~39 s is unexplained and worth chasing once
-the disfluency stage exists, not before.
+The extension is effectively exact. The demonstration was 79 s adrift before
+M11; with disfluency removal built it is **56 s**. We remove 23.2 s in 17 cuts
+against the reference's 27.5 s in 28 — close on seconds, fewer cuts.
+
+The remaining gap is not yet explained. Two things worth checking before
+chasing thresholds: our transcript is our own Whisper `base` (different words
+from the Python's), and 10 candidates die on the quiet-run guard, which v3 did
+not have. **Do not widen a guard to close this gap** — that is exactly the
+trade the guards exist to prevent.
 
 ### 3. dts warnings on sped segments
 
@@ -545,6 +673,25 @@ fallback when Ollama is unreachable — is entirely unbuilt.
 ~1 GB per run on the demo file: 75 MB WAV, 28 segments, `concat.mkv` (273 MB),
 `master.mkv`, PNG frames from the sync check. Keeping the WAV was a deliberate
 choice (open it in Audacity when a mask looks wrong). The rest is undecided.
+
+### 8. Parallel render (M5b) was built, measured, and removed
+
+Scoped threads + an atomic work queue, output byte-identical. But wall clock
+went **348 s → 330 s with 12 workers** — about 5%. Each ffmpeg/libx264 encode
+already multithreads across every core, so running 12 at once just
+oversubscribes; the total CPU work is unchanged. Reverted to serial rather than
+keep complexity that buys nothing. A real speedup would need capped
+`-threads` per job, a faster preset, or GPU encoding.
+
+### 9. Whisper dominates the runtime
+
+Transcription is now the slowest stage: ~330 s for the 20-minute demo (render is
+~470 s with 45 segments). Unresolved by choice — the options are a smaller
+model or different settings, and neither has been measured.
+
+### 10. Cosmetic: "-0.0s removed"
+
+The disfluency line prints `-0.0s` when there are zero cuts. Harmless.
 
 ### 7. `main.rs` split — RESOLVED
 
