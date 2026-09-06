@@ -57,7 +57,9 @@ src/
   signal.rs      DeadTimeSignal trait: Freeze, Slides, None_
   plan.rs        dead_runs, bridge_dead, decide, build_segments,
                  merge_adjacent, trim_edges, Segment/PlanSegment/Plan,
-                 map_to_source (the time map)
+                 map_to_source (the time map), DeadAir + Pacing (policy the
+                 planner is allowed to see)
+  policy.rs      Genre, Policy, the genre->policy table, apply_explicit
   render.rs      atempo_chain, render_segments, concat_segments
   master.rs      master (loudnorm + limiter), finalize
   monitor.rs     propose/re-run/score loop, speech_score
@@ -655,6 +657,62 @@ blocker, not a decision.
 Triage runs before any call: only lines that look risky are sent, because at a
 few seconds each, sending all of them costs twenty minutes and most are fine.
 
+### M14 — prompt → policy
+
+`--prompt` now does something. It is parsed **once, up front**, into a bounded
+`Policy` struct; after that the pipeline is deterministic given that struct. The
+resolved struct is written to `out/policy.json` and `--params` replays it.
+
+```
+Policy { remove_disfluencies, dead_air: Cut|Speed|Keep, max_speed 1..=20,
+         pause_floor_s 0.3..=1.5, target_lufs -23..=-14,
+         expect_screen, captions, chapters, source }
+```
+
+Where each field lands: `expect_screen` skips content-region detection and picks
+the `none` signal; `pause_floor_s` is the planner's min-run filter; `dead_air` +
+`max_speed` drive `decide()`; `remove_disfluencies` skips M11; `target_lufs`
+threads through `master()` and `check_loudness()`; `captions` skips M9.
+`chapters` is parsed but unbuilt. `--signal` and `--params` override the prompt;
+`--no-ai` skips the model entirely.
+
+**The model is asked ONE question: what kind of video is this?** Everything else
+is a table in code. That was not the first design, and the reason it is the
+design now is measured:
+
+| version | result |
+| --- | --- |
+| all 8 fields, one call | `remove_disfluencies: false` on an app demo, **3/3, deterministic** — silently disabled M11, and all five verification checks still passed |
+| that same field asked alone | correct **5/5** |
+| 7 separate questions | fixed disfluencies; then invented `-16 LUFS` for a description that never mentions loudness |
+| 7 questions + explicit "not stated" option | fixed the inventing; but editing the *pause* question's wording flipped the *disfluency* answer, whose text had not changed |
+| **1 genre pick** | **30/30 correct, identical across 5 repeats**, on all four spec examples plus both real prompts |
+
+Three lessons, all of them ones this project had already learned once:
+
+1. **We gated a call on a capability we never probed.** The probe measures
+   "pick one option by index" (`sel 0.83`). Filling eight fields at once is a
+   different task. Claiming the tier covered it is the same failure as the probe
+   that flattered the model.
+2. **A question with no way to abstain measures what the model will invent, not
+   what the description says.** The probe already knew this — index 0 is always
+   "leave it alone". The numeric questions had no such option.
+3. **Tuning seven prompts against the spec's four worked examples is fitting to
+   the test set.** The instability was the tell: it was pattern-matching option
+   lists, not reading the description.
+
+So the genre→policy mapping lives in `Policy::from_genre`, is the spec's own
+worked-example table, and is checked by `genre_table_matches_the_spec`. It is
+reviewable, diffable and identical on every run. Explicit instructions
+("no subtitles", "-16 LUFS") are read by `apply_explicit` with no model at all.
+
+`Genre::Other` returns exact defaults, and
+`unclassified_is_byte_identical_to_defaults` enforces it: **the model failing
+never changes the edit.**
+
+On both test files the prompt classifies as `demo` and the resolved policy
+equals the defaults, so both runs reproduce the pre-M14 numbers exactly.
+
 ## Measured results
 
 ### brainclean_demonstration.mp4 (1170.10 s, 1920x1080@60, −30.22 LUFS)
@@ -787,11 +845,17 @@ segments.
 
 Auto-crop works. The documented override does not exist yet.
 
-### 5. Prompt is unused
+### 5. Prompt is unused — RESOLVED (M14)
 
-Parsed into `Cli`, never read. `CLI_AND_PROMPT.md` §2's `Policy` struct — the
-JSON-schema-constrained single up-front model call, bounded fields, `ok=true`
-fallback when Ollama is unreachable — is entirely unbuilt.
+Built. See M14 above. One deviation from `CLI_AND_PROMPT.md` §2, and it is
+deliberate: the spec describes one model call that fills all eight fields, which
+was built first and measured wrong (3/3 deterministic failure on an app demo).
+The model now answers one classification question and the field mapping is a
+table in code. The observable contract is unchanged — bounded fields, defaults
+when the model is unreachable, resolved struct logged to `out/`, `--params`
+replays.
+
+Still open here: `chapters` is a parsed field with nothing behind it.
 
 ### 6. temp/ is never cleaned
 
@@ -843,6 +907,23 @@ compress dead air, target loudness, pause floor, `expect_screen`,
 `QUIET_DB` and `GATE_DB` are *derived* from `TARGET_LUFS` in `constants.rs`
 rather than written as −44.78 and −38.78, so the coupling is in the code
 instead of only in someone's head.
+
+Since M14 the line is enforced by the build, not by care:
+`tests/prompt_cannot_touch_guards.rs` fails if `policy.rs` names any of the four
+guards, if the `Pacing` struct the planner receives exposes one, or if a numeric
+policy field stops being clamped.
+
+Two places where the distinction needed a judgement call, both recorded here:
+
+* **`MIN_DEAD_S` does two jobs.** As the planner's floor it is pacing, so the
+  prompt sets it (`pause_floor_s`). As the clamp inside `trim_edges` — *never
+  shrink a run below this* — it is a safety invariant, so it stays a constant.
+  Splitting it was the whole point; leaving it as one number would have let a
+  prompt reach the invariant.
+* **`target_lufs` is policy, its tolerance is not.** The prompt picks the
+  delivery target within −23..−14. The ±0.2 LUFS that `check_loudness` accepts
+  is fixed whatever target is asked for, because it describes what single-pass
+  loudnorm actually delivers, not what anyone wants.
 
 ---
 

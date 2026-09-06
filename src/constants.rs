@@ -143,6 +143,12 @@ pub const MASTER_LUFS: f64 = -14.0;
 /// decoupling properly instead.
 pub const LOUDNORM_I: f64 = -13.95;
 
+/// The offset above. Kept separate so a prompt-chosen target (-23..-14 LUFS)
+/// gets the same compensation the default does: ask loudnorm for
+/// `target + LIMITER_COMP`. Deriving it beats a second hardcoded number that
+/// could drift out of step with LOUDNORM_I.
+pub const LIMITER_COMP: f64 = LOUDNORM_I - MASTER_LUFS;
+
 // ---------------------------------------------------------------------------
 // GUARDS — fixed in code, forever (CLI_AND_PROMPT.md §1)
 //

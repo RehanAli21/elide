@@ -21,7 +21,18 @@ pub struct Cli {
     pub transcript: Option<String>,
 
     /// which "nothing is happening" signal to use: freeze (screen recordings),
-    /// slides (slide lectures), none (talking head — silence decides alone)
-    #[arg(long, default_value = "freeze")]
-    pub signal: String,
+    /// slides (slide lectures), none (talking head — silence decides alone).
+    /// Overrides what the prompt implied.
+    #[arg(long)]
+    pub signal: Option<String>,
+
+    /// skip the model entirely — policy comes from defaults, captions stay raw
+    /// ASR. The edit is unaffected: the model never decides a cut.
+    #[arg(long, default_value_t = false)]
+    pub no_ai: bool,
+
+    /// replay an exact parameter set (a policy.json from a previous run)
+    /// instead of asking the model to read the prompt again
+    #[arg(long)]
+    pub params: Option<String>,
 }

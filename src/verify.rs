@@ -6,7 +6,7 @@ use anyhow::{bail, Context, Result};
 use hound::WavReader;
 
 use crate::audio::measure_loudness;
-use crate::constants::{MASTER_LUFS, MASTER_TP};
+use crate::constants::MASTER_TP;
 use crate::plan::{map_to_source, Plan};
 use crate::probe::{ffprobe_json, Probe};
 
@@ -46,10 +46,10 @@ fn find_atom(bytes: &[u8], tag: &[u8; 4]) -> Option<usize> {
 
 // ----------------------------------------------------------------- 4. loudness
 
-fn check_loudness(out_path: &Path) -> Result<Check> {
+fn check_loudness(out_path: &Path, target_lufs: f64) -> Result<Check> {
     let (i, tp) = measure_loudness(
         out_path.to_str().context("non-UTF-8 path")?,
-        MASTER_LUFS,
+        target_lufs,
         &[],
     )?;
 
@@ -63,7 +63,9 @@ fn check_loudness(out_path: &Path) -> Result<Check> {
     //
     // The true-peak limit stays where it is: AAC is the last thing to touch the
     // signal, and the reference clears -1.2 with 0.15-0.20 dB to spare.
-    let passed = (i - MASTER_LUFS).abs() <= 0.2 && tp <= MASTER_TP + 0.3;
+    // The TARGET is policy (the prompt picks -23..-14). The TOLERANCE is not:
+    // +/-0.2 stays fixed whatever target is asked for.
+    let passed = (i - target_lufs).abs() <= 0.2 && tp <= MASTER_TP + 0.3;
 
     Ok(Check {
         name: "loudness",
@@ -258,7 +260,13 @@ fn check_duration(out_path: &Path, plan: &Plan) -> Result<Check> {
     })
 }
 
-pub fn verify(input: &str, out_path: &Path, temp_dir: &Path, plan: &Plan) -> Result<Vec<Check>> {
+pub fn verify(
+    input: &str,
+    out_path: &Path,
+    temp_dir: &Path,
+    plan: &Plan,
+    target_lufs: f64,
+) -> Result<Vec<Check>> {
     let mut checks = Vec::new();
 
     // duration vs plan
@@ -268,7 +276,7 @@ pub fn verify(input: &str, out_path: &Path, temp_dir: &Path, plan: &Plan) -> Res
     checks.push(check_faststart(out_path)?);
 
     // 4. loudness
-    checks.push(check_loudness(out_path)?);
+    checks.push(check_loudness(out_path, target_lufs)?);
 
     // extract the delivered audio once — 1 and 2 both read it
     let verify_wav = temp_dir.join("verify.wav");

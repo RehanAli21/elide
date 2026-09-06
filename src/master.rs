@@ -3,9 +3,11 @@ use std::process::Command;
 
 use anyhow::{bail, Context, Result};
 
-use crate::constants::{COMPRESSOR, HIGHPASS_HZ, LIMITER_CEILING, LOUDNORM_I, MASTER_TP};
+use crate::constants::{COMPRESSOR, HIGHPASS_HZ, LIMITER_CEILING, LIMITER_COMP, MASTER_TP};
 
-pub fn master(input: &Path, out: &Path, compress: bool) -> Result<()> {
+/// `target_lufs` is policy — the prompt picks it within -23..-14. Everything
+/// else here (the true-peak ceiling, the limiter) is fixed.
+pub fn master(input: &Path, out: &Path, compress: bool, target_lufs: f64) -> Result<()> {
     let mut parts = vec![
         format!("highpass=f={HIGHPASS_HZ}"),
         "afftdn=nr=12:nf=-45".to_string(),
@@ -23,7 +25,8 @@ pub fn master(input: &Path, out: &Path, compress: bool) -> Result<()> {
     // reference delivers -1.35/-1.40 dBTP this way.
     //
     // LRA=11 is a ceiling, not a target — the reference delivers 6.10 and 2.80.
-    parts.push(format!("loudnorm=I={LOUDNORM_I}:TP={MASTER_TP}:LRA=11"));
+    let ask = target_lufs + LIMITER_COMP;
+    parts.push(format!("loudnorm=I={ask}:TP={MASTER_TP}:LRA=11"));
 
     // Hard ceiling into the AAC encode. loudnorm keeps the reference's TP=-1.5
     // so integrated loudness matches; the limiter alone owns the peak.

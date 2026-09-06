@@ -72,15 +72,57 @@ pub enum Action {
     Speed { factor: f64 },
 }
 
-pub fn decide(len_s: f64) -> Action {
-    if len_s < 1.0 {
-        Action::Keep
-    } else if len_s < 4.0 {
-        Action::Collapse { to_s: 0.50 }
-    } else {
-        let target = (len_s / 12.0).clamp(1.2, 6.0);
-        Action::Speed {
-            factor: (len_s / target).min(20.0),
+/// What to do with a stretch where nothing is happening. This is POLICY — the
+/// prompt chooses it. It lives here, in core, so that `policy.rs` depends on the
+/// planner and never the other way round; core must stay free of the AI layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DeadAir {
+    /// remove it outright — right for interviews, where a speed-up looks odd
+    Cut,
+    /// collapse short waits, speed long ones (the default, right for demos)
+    Speed,
+    /// leave it alone — the pauses are the content
+    Keep,
+}
+
+/// The plan-shaping knobs the prompt is allowed to set. Bounded before it gets
+/// here; nothing in this struct can reach a guard.
+#[derive(Debug, Clone, Copy)]
+pub struct Pacing {
+    pub dead_air: DeadAir,
+    pub max_speed: f64,
+    /// the planner's floor: runs shorter than this are left alone
+    pub pause_floor_s: f64,
+}
+
+impl Default for Pacing {
+    fn default() -> Self {
+        Pacing {
+            dead_air: DeadAir::Speed,
+            max_speed: 20.0,
+            pause_floor_s: MIN_DEAD_S,
+        }
+    }
+}
+
+pub fn decide(len_s: f64, p: Pacing) -> Action {
+    if len_s < p.pause_floor_s {
+        return Action::Keep;
+    }
+    match p.dead_air {
+        DeadAir::Keep => Action::Keep,
+        // never speed — a wait in an interview is removed, not fast-forwarded
+        DeadAir::Cut => Action::Collapse { to_s: 0.50 },
+        DeadAir::Speed => {
+            if len_s < 4.0 {
+                Action::Collapse { to_s: 0.50 }
+            } else {
+                let target = (len_s / 12.0).clamp(1.2, 6.0);
+                Action::Speed {
+                    factor: (len_s / target).min(p.max_speed),
+                }
+            }
         }
     }
 }
@@ -96,13 +138,14 @@ pub fn build_segments(
     runs: &[(usize, usize)],
     grid_len: usize,
     src_duration_s: f64,
+    pacing: Pacing,
 ) -> Vec<Segment> {
     let mut segs = Vec::new();
     let mut cursor = 0usize;
 
     for &(start, end) in runs {
         let len_s = (end - start) as f64 * GRID_S;
-        let action = decide(len_s);
+        let action = decide(len_s, pacing);
 
         if matches!(action, Action::Keep) {
             continue;

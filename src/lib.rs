@@ -11,6 +11,7 @@ pub mod freeze;
 pub mod master;
 pub mod ai;
 pub mod plan;
+pub mod policy;
 pub mod probe;
 pub mod render;
 pub mod signal;

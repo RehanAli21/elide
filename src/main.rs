@@ -11,7 +11,7 @@ use elide::captions::{write_srt, Word};
 use elide::cli::Cli;
 use elide::constants::{
     ACTIVITY_MIN, BRIDGE_GAP_S, DEAD_BRIDGE_S, EDGE_SMOOTH_S, ENERGY_S, GATE_DB, GRID_H, GRID_S, GRID_W, HIGHPASS_HZ,
-    MASTER_LUFS, MASTER_TP, MAX_BUSY, MIN_BLOB, MIN_DEAD_S, MIN_SPEECH_S, PAD_AFTER_S, PAD_BEFORE_S,
+    MASTER_TP, MAX_BUSY, MIN_BLOB, MIN_SPEECH_S, PAD_AFTER_S, PAD_BEFORE_S,
     QUIET_DB, SAMPLES_PER_SLICE, SAMPLE_RATE, TARGET_LUFS, VAD_CHUNK, VAD_ENTER, VAD_EXIT,
 };
 use elide::crop::{blobs, bounding_box, busy_fraction, cell_activity, content_mask, sample_frames};
@@ -19,12 +19,13 @@ use elide::disfluency::{apply_cuts, find_cuts};
 use elide::features::{boxcar, energy_db, smooth};
 use elide::signal;
 use elide::master::{finalize, master};
-use elide::ai::provider::Ollama;
+use elide::ai::provider::{Capabilities, LlmProvider, Ollama};
 use elide::ai::{capabilities, monitor, tasks};
 use elide::plan::{
     bridge_dead, build_segments, dead_runs, decide, merge_adjacent, speedup_starts, trim_edges,
-    Action, Plan, PlanSegment,
+    Action, DeadAir, Plan, PlanSegment,
 };
+use elide::policy::Policy;
 use elide::probe::{ffprobe_json, parse_fps, Probe};
 use elide::render::{concat_segments, render_segments};
 use elide::utilities::fmt_time;
@@ -79,9 +80,123 @@ fn calibrate_threshold(
     }
 }
 
+/// Find the content region — the part of the frame that actually changes.
+/// Returns None when there isn't one, which is what a talking-head recording
+/// looks like: no screen, so no crop and nothing to freeze-detect.
+fn detect_crop(input: &str, duration: f64, width: u32, height: u32) -> Result<Option<String>> {
+    let frames = sample_frames(input, duration)?;
+    println!("frames      {}", frames.len());
+
+    let activity = cell_activity(&frames);
+    let max = activity.iter().fold(0.0f32, |m, &a| m.max(a));
+    let mean = activity.iter().sum::<f32>() / activity.len() as f32;
+    println!("activity    max {max:.2}  mean {mean:.2}");
+
+    let (mask, threshold) = match content_mask(&activity) {
+        Some(v) => v,
+        None => {
+            println!("no content region (max activity below {ACTIVITY_MIN})");
+            return Ok(None);
+        }
+    };
+
+    let passing = mask.iter().filter(|&&b| b).count();
+    println!("threshold   {threshold:.2}  ({passing} cells pass)");
+
+    let bs = blobs(&mask, GRID_W, GRID_H);
+    println!("blobs       {}", bs.len());
+
+    let mut content: Option<&Vec<usize>> = None;
+
+    for b in &bs {
+        if b.len() < MIN_BLOB {
+            continue;
+        }
+        let busy = busy_fraction(b, &frames);
+        println!(
+            "  {:5} cells   {:.1}% busy{}",
+            b.len(),
+            100.0 * busy,
+            if busy > MAX_BUSY {
+                "   [webcam, rejected]"
+            } else {
+                ""
+            }
+        );
+        if busy > MAX_BUSY {
+            continue;
+        }
+        if content.is_none() {
+            content = Some(b);
+        }
+    }
+
+    let content = match content {
+        Some(b) => b,
+        None => {
+            println!("no content region — all blobs rejected or too small");
+            return Ok(None);
+        }
+    };
+
+    let (cx0, cy0, cx1, cy1) = bounding_box(content, GRID_W);
+
+    let sx = width as f64 / GRID_W as f64;
+    let sy = height as f64 / GRID_H as f64;
+
+    let x = ((cx0 as f64 * sx) as usize) & !1;
+    let y = ((cy0 as f64 * sy) as usize) & !1;
+    let x1 = (((cx1 + 1) as f64 * sx).ceil() as usize).min(width as usize);
+    let y1 = (((cy1 + 1) as f64 * sy).ceil() as usize).min(height as usize);
+    let cw = (x1 - x + 1) & !1;
+    let ch = (y1 - y + 1) & !1;
+
+    Ok(Some(format!("{cw}:{ch}:{x}:{y}")))
+}
+
 #[deny(unused_must_use)]
 fn main() -> Result<()> {
     let args = Cli::parse();
+
+    // ---- policy, resolved ONCE, up front ------------------------------------
+    // THE PROMPT SETS POLICY. THE PROMPT NEVER TOUCHES A GUARD. After this
+    // block the pipeline is deterministic given `policy` — no model influence
+    // is sprinkled through the fourteen steps that follow, and every field has
+    // already been clamped into its documented range.
+    let ai: Option<(Ollama, Capabilities)> = if args.no_ai {
+        println!("ai          disabled (--no-ai)");
+        None
+    } else {
+        let p = Ollama::new("qwen2.5:7b");
+        let c = capabilities::probe(&p);
+        println!("ai          {}", capabilities::describe(&c));
+        Some((p, c))
+    };
+
+    let policy = match &args.params {
+        Some(path) => {
+            let p = Policy::from_file(path)
+                .with_context(|| format!("could not read parameter set {path}"))?;
+            println!("policy      replayed from {path}");
+            p
+        }
+        None => Policy::resolve(
+            &args.prompt,
+            ai.as_ref().map(|(p, c)| (p as &dyn LlmProvider, c)),
+        ),
+    };
+    println!("policy      {}", policy.summary());
+
+    // Log the resolved struct next to the video, so the run is reproducible and
+    // "why did it do that?" has an answer that is not a guess.
+    fs::create_dir_all(&args.output)
+        .with_context(|| format!("could not create {}", args.output))?;
+    let policy_path = PathBuf::from(&args.output).join("policy.json");
+    fs::write(&policy_path, serde_json::to_string_pretty(&policy)?)
+        .with_context(|| format!("could not write {}", policy_path.display()))?;
+    println!("            logged to {} (replay: --params)", policy_path.display());
+
+    let pacing = policy.pacing();
 
     let json = ffprobe_json(&args.input)?;
 
@@ -270,79 +385,37 @@ fn main() -> Result<()> {
         );
     }
 
-    let frames = sample_frames(&args.input, duration)?;
-    println!("frames      {}", frames.len());
-
-    let activity = cell_activity(&frames);
-    let max = activity.iter().fold(0.0f32, |m, &a| m.max(a));
-    let mean = activity.iter().sum::<f32>() / activity.len() as f32;
-    println!("activity    max {max:.2}  mean {mean:.2}");
-    let (mask, threshold) = match content_mask(&activity) {
-        Some(v) => v,
-        None => {
-            println!("no content region (max activity below {ACTIVITY_MIN})");
-            // expect_screen = false, skip freeze detection
-            return Ok(());
-        }
+    // expect_screen is policy: a video of a person talking has no screen to
+    // crop to and nothing to freeze-detect, so we do not spend the frame
+    // sampling looking for one.
+    let detected = if policy.expect_screen {
+        detect_crop(&args.input, duration, width, height)?
+    } else {
+        println!("crop        skipped (prompt says no screen)");
+        None
     };
 
-    let passing = mask.iter().filter(|&&b| b).count();
-    println!("threshold   {threshold:.2}  ({passing} cells pass)");
-
-    let bs = blobs(&mask, GRID_W, GRID_H);
-    println!("blobs       {}", bs.len());
-
-    let mut content: Option<&Vec<usize>> = None;
-
-    for b in &bs {
-        if b.len() < MIN_BLOB {
-            continue;
+    // No content region is not a failure — it is what a talking head looks
+    // like. Fall back to the whole frame and let silence decide alone.
+    let crop = match &detected {
+        Some(c) => {
+            println!("crop        {c}");
+            c.clone()
         }
-        let busy = busy_fraction(b, &frames);
-        println!(
-            "  {:5} cells   {:.1}% busy{}",
-            b.len(),
-            100.0 * busy,
-            if busy > MAX_BUSY {
-                "   [webcam, rejected]"
-            } else {
-                ""
-            }
-        );
-        if busy > MAX_BUSY {
-            continue;
-        }
-        if content.is_none() {
-            content = Some(b);
-        }
-    }
-
-    let content = match content {
-        Some(b) => b,
-        None => {
-            println!("no content region — all blobs rejected or too small");
-            return Ok(());
-        }
+        None => format!("{width}:{height}:0:0"),
     };
-
-    let (cx0, cy0, cx1, cy1) = bounding_box(content, GRID_W);
-
-    let sx = width as f64 / GRID_W as f64;
-    let sy = height as f64 / GRID_H as f64;
-
-    let x = ((cx0 as f64 * sx) as usize) & !1;
-    let y = ((cy0 as f64 * sy) as usize) & !1;
-    let x1 = (((cx1 + 1) as f64 * sx).ceil() as usize).min(width as usize);
-    let y1 = (((cy1 + 1) as f64 * sy).ceil() as usize).min(height as usize);
-    let cw = (x1 - x + 1) & !1;
-    let ch = (y1 - y + 1) & !1;
-
-    let crop = format!("{cw}:{ch}:{x}:{y}");
-    println!("crop        {crop}");
 
     // M12 — signal B behind a trait. The only per-genre piece; everything
-    // downstream is unchanged whichever implementation runs.
-    let signal = signal::for_name(&args.signal)?;
+    // downstream is unchanged whichever implementation runs. --signal overrides
+    // the prompt; with neither, expect_screen picks it.
+    let signal_name = args.signal.clone().unwrap_or_else(|| {
+        if detected.is_some() {
+            "freeze".to_string()
+        } else {
+            "none".to_string()
+        }
+    });
+    let signal = signal::for_name(&signal_name)?;
     let frozen = signal.mask(&args.input, &crop, grid_len, duration)?;
 
     let frozen_pct = 100.0 * frozen.iter().filter(|&&b| b).count() as f64 / grid_len as f64;
@@ -507,12 +580,19 @@ fn main() -> Result<()> {
     let runs = bridge_dead(&runs, &padded, DEAD_BRIDGE_S);
     println!("            {} after bridging", runs.len());
 
-    let min_dead_slices = (MIN_DEAD_S / GRID_S) as usize;
+    // The planner's floor is POLICY — a speaker whose pauses are rhetorical
+    // wants a higher one. The clamp inside trim_edges stays on MIN_DEAD_S:
+    // that one is a safety invariant (never delete a run outright), not pacing.
+    let min_dead_slices = (policy.pause_floor_s / GRID_S) as usize;
     let runs: Vec<_> = runs
         .into_iter()
         .filter(|&(a, b)| b - a >= min_dead_slices)
         .collect();
-    println!("            {} after min_dead filter", runs.len());
+    println!(
+        "            {} after pause floor ({:.2}s)",
+        runs.len(),
+        policy.pause_floor_s
+    );
 
     let before: usize = runs.iter().map(|&(a, b)| b - a).sum();
     let runs = trim_edges(&runs, &energy_edge, GATE_DB);
@@ -523,26 +603,32 @@ fn main() -> Result<()> {
         (before - after) as f64 * GRID_S
     );
 
-    let under_1 = runs
+    let floor = policy.pause_floor_s;
+    let split = if policy.dead_air == DeadAir::Speed {
+        4.0
+    } else {
+        f64::INFINITY
+    };
+    let under = runs
         .iter()
-        .filter(|&&(a, b)| (b - a) as f64 * GRID_S < 1.0)
+        .filter(|&&(a, b)| (b - a) as f64 * GRID_S < floor)
         .count();
     let cut = runs
         .iter()
-        .filter(|&&(a, b)| (1.0..4.0).contains(&((b - a) as f64 * GRID_S)))
+        .filter(|&&(a, b)| (floor..split).contains(&((b - a) as f64 * GRID_S)))
         .count();
     let speed = runs
         .iter()
-        .filter(|&&(a, b)| (b - a) as f64 * GRID_S >= 4.0)
+        .filter(|&&(a, b)| (b - a) as f64 * GRID_S >= split)
         .count();
 
-    println!("  < 1.0 s   {under_1}  (ignored)");
-    println!("  1-4 s     {cut}  (collapse)");
-    println!("  >= 4.0 s  {speed}  (speed up)");
+    println!("  < {floor:.2} s  {under}  (ignored)");
+    println!("  short      {cut}  (collapse)");
+    println!("  long       {speed}  (speed up, max {:.0}x)", policy.max_speed);
 
     for &(a, b) in &runs {
         let len_s = (b - a) as f64 * GRID_S;
-        match decide(len_s) {
+        match decide(len_s, pacing) {
             Action::Keep => {}
             act => println!(
                 "  {} {:.1}s -> {:?}",
@@ -553,70 +639,78 @@ fn main() -> Result<()> {
         }
     }
 
-    let segs = build_segments(&runs, grid_len, duration);
+    let segs = build_segments(&runs, grid_len, duration, pacing);
     let segs = merge_adjacent(segs);
 
-    // M11 — disfluency cuts, subtracted from the 1x segments only
-    let (cuts, rejected, clipped) = find_cuts(&words, &samples, spec.sample_rate, &energy_sm, &energy_edge, &segs);
-    let cut_s: f64 = cuts.iter().map(|c| c.end - c.start).sum();
-    let fillers = cuts.iter().filter(|c| c.kind == "filler").count();
-    let stutters = cuts.iter().filter(|c| c.kind == "stutter").count();
-    let repeats = cuts.iter().filter(|c| c.kind == "repeat").count();
-    println!(
-        "disfluency  {} cuts ({fillers} filler, {stutters} stutter, {repeats} repeat), {cut_s:.1}s removed, {} rejected",
-        cuts.len(),
-        rejected.len()
-    );
-    // repeats the rule found but the audio would not allow a cut at
-    if clipped > 0 {
-        println!("  clipped     {clipped}  (repeat found, no alignment passed)");
-    }
-    // proposed vs accepted per kind — separates "the detector found few" from
-    // "the gates threw many away"
-    // seconds per kind, not just counts — the gap has repeatedly turned out to
-    // be cut length rather than cut count.
-    // Reference (v6): filler ~26 / ~17.4s / avg 0.67s, repeat 9 / ~40.5s / avg 4.5s
-    for kind in ["filler", "stutter", "repeat"] {
-        let ok = cuts.iter().filter(|c| c.kind == kind).count();
-        let no = rejected.iter().filter(|r| r.kind == kind).count();
-        let secs: f64 = cuts
-            .iter()
-            .filter(|c| c.kind == kind)
-            .map(|c| c.end - c.start)
-            .sum();
-        let avg = if ok > 0 { secs / ok as f64 } else { 0.0 };
+    // M11 — disfluency cuts, subtracted from the 1x segments only. Whether to
+    // run at all is policy: on a podcast the natural speech IS the product.
+    let (cuts, rejected, clipped) = if policy.remove_disfluencies {
+        find_cuts(&words, &samples, spec.sample_rate, &energy_sm, &energy_edge, &segs)
+    } else {
+        println!("disfluency  off (prompt keeps natural speech)");
+        (Vec::new(), Vec::new(), 0)
+    };
+    if policy.remove_disfluencies {
+        let cut_s: f64 = cuts.iter().map(|c| c.end - c.start).sum();
+        let fillers = cuts.iter().filter(|c| c.kind == "filler").count();
+        let stutters = cuts.iter().filter(|c| c.kind == "stutter").count();
+        let repeats = cuts.iter().filter(|c| c.kind == "repeat").count();
         println!(
-            "  {kind:8}    {ok} accepted of {:2} proposed, {secs:5.1}s  avg {avg:.2}s",
-            ok + no
+            "disfluency  {} cuts ({fillers} filler, {stutters} stutter, {repeats} repeat), {cut_s:.1}s removed, {} rejected",
+            cuts.len(),
+            rejected.len()
         );
-    }
-    // per-chain detail for repeats: 2-take chains everywhere means the chain is
-    // truncating, which shows up as more repeats each shorter than the reference
-    for c in cuts.iter().filter(|c| c.kind == "repeat") {
-        println!(
-            "    {}  {} takes  span {:5.2}s  {:13}  sim {:.2}  {:?}",
-            fmt_time(c.start),
-            c.takes,
-            c.end - c.start,
-            c.align,
-            c.sim,
-            c.text
-        );
-    }
-    // why candidates died — the first word of each reason, counted
-    let mut why_counts: Vec<(String, usize)> = Vec::new();
-    for r in &rejected {
-        let key = r.why.split_whitespace().next().unwrap_or("?").to_string();
-        match why_counts.iter_mut().find(|(k, _)| *k == key) {
-            Some((_, n)) => *n += 1,
-            None => why_counts.push((key, 1)),
+        // repeats the rule found but the audio would not allow a cut at
+        if clipped > 0 {
+            println!("  clipped     {clipped}  (repeat found, no alignment passed)");
         }
-    }
-    for (why, n) in &why_counts {
-        println!("  rejected {n:3}  {why}");
-    }
-    for r in rejected.iter().take(8) {
-        println!("    {:8.2} {:8} {}", r.start, r.kind, r.why);
+        // proposed vs accepted per kind — separates "the detector found few" from
+        // "the gates threw many away"
+        // seconds per kind, not just counts — the gap has repeatedly turned out to
+        // be cut length rather than cut count.
+        // Reference (v6): filler ~26 / ~17.4s / avg 0.67s, repeat 9 / ~40.5s / avg 4.5s
+        for kind in ["filler", "stutter", "repeat"] {
+            let ok = cuts.iter().filter(|c| c.kind == kind).count();
+            let no = rejected.iter().filter(|r| r.kind == kind).count();
+            let secs: f64 = cuts
+                .iter()
+                .filter(|c| c.kind == kind)
+                .map(|c| c.end - c.start)
+                .sum();
+            let avg = if ok > 0 { secs / ok as f64 } else { 0.0 };
+            println!(
+                "  {kind:8}    {ok} accepted of {:2} proposed, {secs:5.1}s  avg {avg:.2}s",
+                ok + no
+            );
+        }
+        // per-chain detail for repeats: 2-take chains everywhere means the chain is
+        // truncating, which shows up as more repeats each shorter than the reference
+        for c in cuts.iter().filter(|c| c.kind == "repeat") {
+            println!(
+                "    {}  {} takes  span {:5.2}s  {:13}  sim {:.2}  {:?}",
+                fmt_time(c.start),
+                c.takes,
+                c.end - c.start,
+                c.align,
+                c.sim,
+                c.text
+            );
+        }
+        // why candidates died — the first word of each reason, counted
+        let mut why_counts: Vec<(String, usize)> = Vec::new();
+        for r in &rejected {
+            let key = r.why.split_whitespace().next().unwrap_or("?").to_string();
+            match why_counts.iter_mut().find(|(k, _)| *k == key) {
+                Some((_, n)) => *n += 1,
+                None => why_counts.push((key, 1)),
+            }
+        }
+        for (why, n) in &why_counts {
+            println!("  rejected {n:3}  {why}");
+        }
+        for r in rejected.iter().take(8) {
+            println!("    {:8.2} {:8} {}", r.start, r.kind, r.why);
+        }
     }
     let segs = apply_cuts(segs, &cuts);
 
@@ -695,11 +789,11 @@ fn main() -> Result<()> {
     let highpass = format!("highpass=f={HIGHPASS_HZ}");
     let (master_i, master_tp) = measure_loudness(
         concat_path.to_str().context("non-UTF-8 path")?,
-        MASTER_LUFS,
+        policy.target_lufs,
         &[&highpass, "afftdn=nr=12:nf=-45"],
     )?;
 
-    let master_gain = MASTER_LUFS - master_i;
+    let master_gain = policy.target_lufs - master_i;
     let would_clip = master_tp + master_gain > MASTER_TP;
 
     println!("master_i    {master_i:.2} LUFS");
@@ -708,7 +802,7 @@ fn main() -> Result<()> {
     println!("compressor  {}", if would_clip { "yes" } else { "no" });
 
     let master_path = temp_dir.join("master.mkv");
-    master(&concat_path, &master_path, would_clip)?;
+    master(&concat_path, &master_path, would_clip, policy.target_lufs)?;
 
     let out_path = PathBuf::from(&args.output).join("out.mp4");
     finalize(&master_path, &out_path)?;
@@ -726,13 +820,17 @@ fn main() -> Result<()> {
     let scale = measured / plan.out_duration_s;
 
     let srt_path = PathBuf::from(&args.output).join("captions.srt");
-    let n = write_srt(&words, &plan, scale, &srt_path)?;
-    println!(
-        "captions    {n} cues -> {} (scale {scale:.5})",
-        srt_path.display()
-    );
+    if policy.captions {
+        let n = write_srt(&words, &plan, scale, &srt_path)?;
+        println!(
+            "captions    {n} cues -> {} (scale {scale:.5})",
+            srt_path.display()
+        );
+    } else {
+        println!("captions    off (prompt)");
+    }
 
-    let checks = verify(&args.input, &out_path, &temp_dir, &plan)?;
+    let checks = verify(&args.input, &out_path, &temp_dir, &plan, policy.target_lufs)?;
 
     println!("\nverification:");
     for c in &checks {
@@ -753,12 +851,9 @@ fn main() -> Result<()> {
         .filter_map(|cue| cue.lines().nth(2).map(str::to_string))
         .collect();
 
-    if !cap_lines.is_empty() {
-        let provider = Ollama::new("qwen2.5:7b");
-        let caps = capabilities::probe(&provider);
-        println!("\nai          {}", capabilities::describe(&caps));
-
-        let flagged = tasks::proofread_list(&provider, &caps, &cap_lines);
+    // Reuses the provider probed at the top of the run — one probe, not two.
+    if let (false, Some((provider, caps))) = (cap_lines.is_empty(), &ai) {
+        let flagged = tasks::proofread_list(provider, caps, &cap_lines);
         if flagged.is_empty() {
             println!("proofread   nothing flagged");
         } else {
