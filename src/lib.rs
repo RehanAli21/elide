@@ -9,6 +9,7 @@ pub mod dsp;
 pub mod features;
 pub mod freeze;
 pub mod master;
+pub mod monitor;
 pub mod plan;
 pub mod probe;
 pub mod render;

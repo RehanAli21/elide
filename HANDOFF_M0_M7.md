@@ -58,7 +58,8 @@ src/
                  merge_adjacent, trim_edges, Segment/PlanSegment/Plan,
                  map_to_source (the time map)
   render.rs      atempo_chain, render_segments, concat_segments
-  master.rs      master (two-pass loudnorm), finalize
+  master.rs      master (loudnorm + limiter), finalize
+  monitor.rs     propose/re-run/score loop, speech_score
   verify.rs      Check + the five checks (duration, faststart, loudness,
                  splice clicks, a/v sync)
   utilities.rs   fmt_time
@@ -529,6 +530,51 @@ FFT rather than pulling in an FFT crate.
 
 Expect most candidates to be rejected — that is the system working. On the demo:
 17 accepted, 21 rejected (10 quiet-run, 6 duration, 3 splice, 2 not-in-1x).
+
+### M12b — the monitor loop
+
+**The model proposes. The measurement decides.** The model is never a judge and
+never sees a pass/fail question. It gets one step's diagnostic, the current
+parameter values, and one sentence of *causal* guidance ("Lower = more
+sensitive"), and answers with one parameter name and a direction, under a JSON
+schema whose `direction` is a hard enum. The code then re-runs the step with
+that parameter nudged x1.6 or /1.6, scores both results, and keeps the better.
+A wrong proposal costs one extra run and is discarded by the score.
+
+**Asking it to judge does not work, and this was measured.** Given the
+verification table, qwen2.5:7b replied "OK" to a corrupted a/v sync of 0.412.
+Told the healthy ranges, it caught that — but false-alarmed on clean data
+(calling a 0.06 s deviation "more than 0.5 seconds"), called -1.91 dBTP "above
+the maximum allowed -1.2" (sign backwards), and called -13.91 LUFS outside a
+±0.2 band it is inside. It cannot do threshold arithmetic. Under the
+propose/score design it does not have to.
+
+**Verification is not monitored, deliberately.** Only a step with both an
+automatic quality score and an adjustable parameter can be monitored.
+Verification has neither — it is already deterministic and can already fail the
+export. BUILD_STEPS M12b's "flag the right checkpoint" framing asks for the
+judge design that does not work; the propose/score design is what shipped in v6.
+
+**Guards are not adjustable here.** The reference lets the model nudge SNAP and
+QUIET; this project does not, so the only accepted parameter is the VAD
+threshold, which `constants.rs` marks POLICY. A proposal naming anything else is
+discarded by the caller before it can do work.
+
+**No-signal detector.** The score is `coverage - false_alarm`, so a value at or
+below zero means the mask marks silence as often as speech — no better than
+chance, and no basis for preferring one mask to another. Needs no invented
+constant; zero is the definition. Measured:
+
+```
+demo       score range 0.244 .. 0.286   current 0.256   proposal discarded by score
+extension  score range -0.004 .. 0.012  current -0.003  no signal, proposals ignored
+```
+
+Without that guard the extension accepted a 0.30 -> 0.48 threshold change on a
+0.003 difference — the "tuner that cannot detect its own blindness" failure.
+
+If ollama is unreachable the result is `ok=true`, indistinguishable from
+approval, and the pipeline runs on its defaults.
 
 ## Measured results
 

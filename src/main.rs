@@ -19,6 +19,7 @@ use elide::disfluency::{apply_cuts, find_cuts};
 use elide::features::{boxcar, energy_db, smooth};
 use elide::freeze::{detect_freezes, paint_freezes};
 use elide::master::{finalize, master};
+use elide::monitor;
 use elide::plan::{
     bridge_dead, build_segments, dead_runs, decide, merge_adjacent, speedup_starts, trim_edges,
     Action, Plan, PlanSegment,
@@ -436,6 +437,77 @@ fn main() -> Result<()> {
         println!("recalibrated speech {pct:.1}% (default was {VAD_ENTER:.2})");
         padded
     } else {
+        padded
+    };
+
+    // M12b — monitor the speech step. The model proposes ONE parameter and a
+    // direction; the code re-runs and the SCORE decides which mask survives.
+    // Only the VAD threshold is adjustable: SNAP and QUIET are guards, and
+    // nothing outside constants.rs may widen a guard — so a proposal naming
+    // anything else is discarded here, before it can do any work.
+    // How much discriminating power does the score have on THIS file? Measured,
+    // not assumed: the same sweep M4b uses, scored. If the whole range is
+    // negligible the score cannot tell two masks apart, and accepting a
+    // proposal on that is the "tuner that cannot detect its own blindness"
+    // failure — worse than leaving the constant alone.
+    let sweep_scores: Vec<f64> = [0.50f32, 0.40, 0.30, 0.25, 0.20, 0.15]
+        .iter()
+        .map(|&t| {
+            let m = speech_mask(&probs, t, (t - 0.15).max(0.01), grid_len);
+            monitor::speech_score(&m, &words, grid_len)
+        })
+        .collect();
+    let lo = sweep_scores.iter().cloned().fold(f64::INFINITY, f64::min);
+    let hi = sweep_scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    println!("score range {lo:.3} .. {hi:.3}  (span {:.3})", hi - lo);
+
+    let score = monitor::speech_score(&padded, &words, grid_len);
+    let longest = longest_silences(&padded, 1)
+        .first()
+        .map(|&(a, b)| (b - a) as f64 * GRID_S)
+        .unwrap_or(0.0);
+    let speech_pct = 100.0 * padded.iter().filter(|&&b| b).count() as f64 / grid_len as f64;
+
+    let verdict = monitor::review(
+        "speech detection",
+        &format!("speech {speech_pct:.1}%\nscore {score:.3}\nlongest silence {longest:.2}s"),
+        &format!("{{\"threshold\": {chosen:.2}}}"),
+        "Lower = more sensitive. Increase if silence is called speech.",
+    );
+
+    // NO-SIGNAL DETECTOR. The score is coverage minus false-alarm, so a value
+    // at or below zero means the mask marks silence as often as speech — no
+    // better than chance, and no basis for preferring one mask over another.
+    // Measured: demo 0.256 (informative), extension -0.003 (degenerate, where
+    // an unguarded loop accepted a 0.30 -> 0.48 change on 0.003 of noise).
+    // Needs no invented threshold; zero is the definition.
+    let informative = score > 0.0;
+    if !informative {
+        println!("monitor     no signal (score {score:.3} <= 0) — proposals ignored");
+    }
+
+    let padded = if informative
+        && !verdict.ok
+        && verdict.parameter == "threshold"
+        && verdict.direction != "none"
+    {
+        let t2 = if verdict.direction == "increase" {
+            chosen * 1.6
+        } else {
+            chosen / 1.6
+        };
+        let alt = speech_mask(&probs, t2, (t2 - 0.15).max(0.01), grid_len);
+        let alt_score = monitor::speech_score(&alt, &words, grid_len);
+        println!(
+            "monitor     proposed threshold {} -> {t2:.3}, score {score:.3} vs {alt_score:.3} — {}",
+            verdict.direction,
+            if alt_score > score { "KEPT" } else { "discarded" }
+        );
+        if alt_score > score { alt } else { padded }
+    } else {
+        if informative {
+            println!("monitor     ok ({})", verdict.reason);
+        }
         padded
     };
 
