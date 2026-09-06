@@ -13,6 +13,7 @@ pub mod monitor;
 pub mod plan;
 pub mod probe;
 pub mod render;
+pub mod signal;
 pub mod utilities;
 pub mod vad;
 pub mod verify;

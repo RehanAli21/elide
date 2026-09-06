@@ -17,7 +17,7 @@ use elide::constants::{
 use elide::crop::{blobs, bounding_box, busy_fraction, cell_activity, content_mask, sample_frames};
 use elide::disfluency::{apply_cuts, find_cuts};
 use elide::features::{boxcar, energy_db, smooth};
-use elide::freeze::{detect_freezes, paint_freezes};
+use elide::signal;
 use elide::master::{finalize, master};
 use elide::monitor;
 use elide::plan::{
@@ -339,24 +339,13 @@ fn main() -> Result<()> {
     let crop = format!("{cw}:{ch}:{x}:{y}");
     println!("crop        {crop}");
 
-    let freezes = detect_freezes(&args.input, &crop)?;
-
-    let total: f64 = freezes
-        .iter()
-        .map(|&(s, e)| e.unwrap_or(duration) - s)
-        .sum();
-
-    println!(
-        "freezes     {} blocks, {:.1} s frozen ({:.1}%)",
-        freezes.len(),
-        total,
-        100.0 * total / duration
-    );
-
-    let frozen = paint_freezes(&freezes, grid_len, duration);
+    // M12 — signal B behind a trait. The only per-genre piece; everything
+    // downstream is unchanged whichever implementation runs.
+    let signal = signal::for_name(&args.signal)?;
+    let frozen = signal.mask(&args.input, &crop, grid_len, duration)?;
 
     let frozen_pct = 100.0 * frozen.iter().filter(|&&b| b).count() as f64 / grid_len as f64;
-    println!("frozen      {frozen_pct:.1}% of grid");
+    println!("frozen      {frozen_pct:.1}% of grid  (signal: {})", signal.name());
     let dead = padded
         .iter()
         .zip(&frozen)

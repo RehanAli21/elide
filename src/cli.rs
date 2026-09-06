@@ -19,4 +19,9 @@ pub struct Cli {
     /// instead of running whisper — a debugging override
     #[arg(long)]
     pub transcript: Option<String>,
+
+    /// which "nothing is happening" signal to use: freeze (screen recordings),
+    /// slides (slide lectures), none (talking head — silence decides alone)
+    #[arg(long, default_value = "freeze")]
+    pub signal: String,
 }

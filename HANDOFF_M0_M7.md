@@ -54,6 +54,7 @@ src/
   crop.rs        sample_frames, cell_activity, content_mask, blobs,
                  bounding_box, busy_fraction
   freeze.rs      detect_freezes, paint_freezes
+  signal.rs      DeadTimeSignal trait: Freeze, Slides, None_
   plan.rs        dead_runs, bridge_dead, decide, build_segments,
                  merge_adjacent, trim_edges, Segment/PlanSegment/Plan,
                  map_to_source (the time map)
@@ -530,6 +531,39 @@ FFT rather than pulling in an FFT crate.
 
 Expect most candidates to be rejected — that is the system working. On the demo:
 17 accepted, 21 rejected (10 quiet-run, 6 duration, 3 splice, 2 not-in-1x).
+
+### M12 — signal B behind a trait
+
+`DeadTimeSignal` in `signal.rs`, chosen with `--signal freeze|slides|none`.
+The trait arrives now and not earlier: with one implementation there was
+nothing to generalise over and a plain function was correct.
+
+| signal | genre | mask |
+| --- | --- | --- |
+| `freeze` | screen recording | freezedetect on the content crop (default, unchanged) |
+| `slides` | slide lecture | freeze detection *inverted* |
+| `none` | talking head | **all true** |
+
+**`slides` is inverted for a reason.** A slide is a still image, so "picture is
+static" is true almost everywhere and carries no information. What carries the
+lecture is the slide *change*, so the mask is true everywhere EXCEPT a short
+window after each change — the only moment something is happening. It reads the
+whole frame, not the content crop: a slide fills the frame and there is no app
+window to isolate.
+
+**`none` returns ALL TRUE, and the sign is the whole point.** The decision is
+`dead = (not speaking) AND (nothing happening)`, so an all-true mask collapses
+it to silence-only — ordinary audio-based behaviour. All-*false* would mean
+nothing is ever dead and the tool would silently do nothing on every talking-head
+video. Measured on the extension: `none` reports 100.0% of grid, not 0.0%.
+
+Verified behaviour-preserving: with `--signal freeze` the demo is unchanged
+(89.1% frozen, 867.4 s, all five checks pass). On the extension all three signals
+produce a valid edit — and the same output, because that file has almost nothing
+to cut, so signal B barely participates. That is correct, not a bug.
+
+Nothing downstream changed. The plan, time map, render, master, captions and
+verification never learn which signal ran.
 
 ### M12b — the monitor loop
 
