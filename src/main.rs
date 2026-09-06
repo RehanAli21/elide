@@ -19,7 +19,8 @@ use elide::disfluency::{apply_cuts, find_cuts};
 use elide::features::{boxcar, energy_db, smooth};
 use elide::signal;
 use elide::master::{finalize, master};
-use elide::monitor;
+use elide::ai::provider::Ollama;
+use elide::ai::{capabilities, monitor, tasks};
 use elide::plan::{
     bridge_dead, build_segments, dead_runs, decide, merge_adjacent, speedup_starts, trim_edges,
     Action, Plan, PlanSegment,
@@ -741,6 +742,31 @@ fn main() -> Result<()> {
             if c.passed { "PASS" } else { "FAIL" },
             c.detail
         );
+    }
+
+    // M13 — the safest AI task: flag caption lines a human should proofread.
+    // It edits nothing, so a wrong answer costs nothing. Triage runs first, so
+    // only the risky-looking lines cost a call.
+    let cap_lines: Vec<String> = fs::read_to_string(&srt_path)
+        .unwrap_or_default()
+        .split("\n\n")
+        .filter_map(|cue| cue.lines().nth(2).map(str::to_string))
+        .collect();
+
+    if !cap_lines.is_empty() {
+        let provider = Ollama::new("qwen2.5:7b");
+        let caps = capabilities::probe(&provider);
+        println!("\nai          {}", capabilities::describe(&caps));
+
+        let flagged = tasks::proofread_list(&provider, &caps, &cap_lines);
+        if flagged.is_empty() {
+            println!("proofread   nothing flagged");
+        } else {
+            println!("proofread   {} lines worth a human look:", flagged.len());
+            for l in flagged.iter().take(10) {
+                println!("  {l}");
+            }
+        }
     }
 
     if checks.iter().any(|c| !c.passed) {

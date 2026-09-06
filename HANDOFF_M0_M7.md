@@ -610,6 +610,51 @@ Without that guard the extension accepted a 0.30 -> 0.48 threshold change on a
 If ollama is unreachable the result is `ok=true`, indistinguishable from
 approval, and the pipeline runs on its defaults.
 
+### M13 — the AI layer
+
+**The deterministic pipeline decides. The model only proposes, inside a closed
+action space, behind a deterministic gate.** The video is byte-identical whether
+this layer runs or not; only text artefacts improve.
+
+`src/ai/` — `provider` (LlmProvider, Ollama, Null), `capabilities` (the probe),
+`gates`, `tasks`, `monitor`. `monitor` moved here from core because it *is* an
+AI task (AI_ARCHITECTURE §8.6), even though a deterministic score decides what
+it changes.
+
+**The boundary is enforced by a test, not a convention.**
+`tests/core_has_no_ai.rs` fails the build if any core module references
+`crate::ai`, with a second test singling out `verify.rs` — if a model could
+reach verification, a model could pass a broken export.
+
+**The probe measures, and an early version of it lied.** First cut asked the
+model to echo single words, scored generation 4/4, and promoted it a whole tier
+on nothing. Second cut asked for real caption repair but *put the answer in the
+prompt* ("the screen shows a field labelled Duration") — still 4/4, because it
+only had to copy the question back. With the answers removed:
+
+```
+qwen2.5:7b   json true  sel 0.83  gen 0.00  tier Mid  (PROVISIONAL, 10 items)
+null         json false sel 0.00  gen 0.00  tier None
+```
+
+`gen 1.00 -> 0.00` the moment the answer left the prompt. That reproduces the
+reference's finding: this model does selection, not generation — so caption
+*correction* is disabled and only proposals-for-review are allowed. A probe that
+flatters the model is worse than no probe; it is the same failure as a tuner
+that cannot tell it is blind, so the tier is printed as PROVISIONAL below the
+documented 30-item minimum.
+
+**`caption.intelligible` is built; `caption.fix` is not.** The first is safest —
+it only flags lines for a human, so a wrong answer costs nothing. The gate for
+the second exists and is tested (`min` of direct and consonant-skeleton
+similarity, never `max` — `max` let `division -> schedules` through at exactly
+0.40, the precise hallucination it exists to stop), but applying fixes needs
+per-scene OCR vocabulary, and no OCR engine is installed. That is the honest
+blocker, not a decision.
+
+Triage runs before any call: only lines that look risky are sent, because at a
+few seconds each, sending all of them costs twenty minutes and most are fine.
+
 ## Measured results
 
 ### brainclean_demonstration.mp4 (1170.10 s, 1920x1080@60, −30.22 LUFS)
