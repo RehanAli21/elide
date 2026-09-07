@@ -94,12 +94,27 @@ pub const BRIDGE_GAP_S: f64 = 0.35;
 /// Keyboard clicks, chair creaks, half-caught breaths.
 pub const MIN_SPEECH_S: f64 = 0.25;
 
-/// Speech run extended backwards by this.
-/// So a later cut never lands on a consonant onset.
+/// Speech run extended backwards by this. Raised 0.50 -> 1.50 to stop a word
+/// being clipped, and it does NOT work the way the name suggests.
+///
+/// The bug: at 6.56 s on the demo the last syllable of "BrainClean" was cut.
+/// Traced through the artifacts — Silero decided the voice stopped at 5.51 s,
+/// PAD_AFTER_S protected to 6.06 s, and 6.06-7.06 became a dead run of exactly
+/// 1.00 s against a 1.00 s floor. It scraped in, and a 1-4 s run is collapsed
+/// to 0.5 s, so 6.56-7.06 was deleted — over the tail of the word.
+///
+/// The obvious fix is a longer PAD_AFTER_S, since the damage is at the END of
+/// speech. This is the other one: extending the FOLLOWING run backwards by
+/// 1.50 s swallows the whole 1.00 s gap, so the dead run stops existing and
+/// there is nothing left to collapse. Verified — the cut is gone from the plan.
+///
+/// The cost is real and measured: short gaps near speech now vanish, so less is
+/// removed. Demo 60 -> 54 segments, 867.4 s -> 872.2 s output. Paying ~5 s of
+/// dead air to stop clipping words is the right trade, but it IS a trade.
 pub const PAD_BEFORE_S: f64 = 1.50;
 
 /// Speech run extended forwards by this.
-/// Longer than PAD_BEFORE_S because speech trails off rather than stopping.
+/// No longer longer than PAD_BEFORE_S — see the note there.
 pub const PAD_AFTER_S: f64 = 0.55;
 
 // ---------------------------------------------------------------------------

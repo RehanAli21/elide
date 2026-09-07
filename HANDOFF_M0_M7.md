@@ -1,16 +1,25 @@
-# elide — handoff, M0 through M7
+# elide — handoff, M0 through M14
 
-State as of the end of the M7 session. Everything through M7 is built and
+Started as the M7 handoff; it now covers the whole build. Everything is
 verified against two real videos — all five verification checks pass on both.
-Since then (follow-up sessions), in order: the word-clip check was removed,
-mastering became two-pass, the duration check was added, M8 landed as a one-line
-pre-flight verdict, M4-M7 was split out of `main.rs` into modules, M4b threshold
-calibration was built (reads "no signal" on both files), M5b parallel render was
-built and then **removed** (no material speedup — each ffmpeg already saturates
-the cores), chunked Whisper word alignment was built, then **M9 captions** and
-**M11 disfluency removal**. M10 was deliberately skipped until there is a GUI.
 
-The pipeline now runs end to end with no outside files: it transcribes itself,
+In order, across sessions: the word-clip check was removed; mastering went
+two-pass and then back to **single-pass + limiter**; the duration check was
+added; M8 landed as a one-line pre-flight verdict; M4-M7 was split out of
+`main.rs` into modules; M4b threshold calibration was built (reads "no signal"
+on both files); M5b parallel render was built and then **removed** (no material
+speedup — each ffmpeg already saturates the cores); chunked Whisper word
+alignment was built; then **M9 captions**, **M11 disfluency removal**, **M12**
+(the `DeadTimeSignal` trait), **M12b** (the monitor loop), **M13** (the AI
+layer), and **M14** (prompt → policy). M10 was deliberately skipped until there
+is a GUI.
+
+Most recently: `PAD_BEFORE_S` was raised 0.50 → 1.50 to stop a word being
+clipped, `pause_floor_s` was removed from policy back into `constants.rs`, and
+an investigation into the repeats Whisper hides was measured and closed as
+not-reachable (issue 11).
+
+The pipeline runs end to end with no outside files: it transcribes itself,
 cuts dead air *and* disfluencies, masters, writes captions, and verifies.
 
 This document records what was built, what was *decided and why*, and what the
@@ -28,8 +37,38 @@ Three inputs, per `CLI_AND_PROMPT.md`:
 elide --input demo.mp4 --output out/ --prompt "demo of my app, for YouTube"
 ```
 
-The prompt is parsed into the CLI struct but **not yet used**. Policy parsing
-(`CLI_AND_PROMPT.md` §2) is unbuilt.
+The prompt is live since M14 — it is classified into a genre and mapped to a
+bounded `Policy` struct, which is logged to `out/policy.json`. Flags:
+
+```
+--signal freeze|slides|none    override the signal the prompt implied
+--params out/policy.json       replay an exact past run
+--no-ai                        skip the model entirely; defaults are used
+--transcript words.json        skip whisper (fast re-runs)
+```
+
+---
+
+## Where this stands
+
+**BUILD_STEPS is complete.** M0-M9 and M11-M14 are built and verified; M10 was
+deliberately skipped until there is a GUI. Both test videos pass all five
+verification checks. The pipeline needs no outside files: it transcribes
+itself, cuts dead air *and* disfluencies, masters, writes captions, verifies,
+and refuses to export if a check fails.
+
+**Next: a UI.** That also unblocks M10 (the revision loop), which was skipped
+precisely because there was no interface for a human to revise anything. The
+pieces M10 needs already exist — `plan.json` is the edit decision list,
+`policy.json` is the parameter set, and `--params` replays it — so the loop is
+"show the plan, let the user change it, re-render", not new pipeline work.
+
+Known limits going in, all documented under Open issues:
+
+- ~26.5 s more output than the Python reference on the demo file (issue 2)
+- repeats that whisper collapses cannot currently be found at all (issue 11)
+- `chapters` is a policy field with nothing behind it (issue 5)
+- `--crop` override unbuilt (issue 4); `temp/` never cleaned, ~1 GB/run (issue 6)
 
 ---
 
@@ -724,69 +763,73 @@ equals the defaults, so both runs reproduce the pre-M14 numbers exactly.
 
 ## Measured results
 
+Re-measured after `PAD_BEFORE_S` went 0.50 -> 1.50 (the word-clip fix). Every
+number below moved, because that constant changes the speech mask and the speech
+mask feeds everything.
+
 ### brainclean_demonstration.mp4 (1170.10 s, 1920x1080@60, −30.22 LUFS)
 
 ```
 gain            +7.22 dB     peak 1.1450, 23 samples over 1.0
 grid_len        58503
-grid speech     43.2%   -> bridged 48.9% -> dropped 48.6% (21) -> padded 68.0%
+grid speech     43.2%   -> bridged 48.9% -> dropped 48.6% (21) -> padded 72.8%
 crop            384:828:768:108      (hand-measured: 374:820:773:113)
-blobs           1876 cells 33.7% busy | 326 cells 100.0% busy [rejected]
 freezes         77 blocks, 1042.7 s (89.1%)      ground truth: 80 / 1047.4
-dead            28.8% of grid
+dead            25.3% of grid
 energy          117006 frames (= grid_len x 2 exactly)
-                44.0% < QUIET | 10.8% mid | 45.2% >= GATE
-dead runs       99 raw -> 92 bridged -> 22 filtered -> 22 trimmed (43.5 s)
-                17 collapse, 5 speed-up
-segments        28
-output          925.1 s (20.9% removed)
-render          ~340-380 s
-transcript      1929 words (chunked whisper)   Python chunked pass: 1893
-disfluency      17 cuts (5 filler, 2 stutter, 10 repeat/false-start), 23.2 s
-                21 rejected: 10 quiet-run, 6 duration, 3 splice, 2 not-in-1x
-segments        45
-output          901.9 s (22.9% removed)
-captions        182 cues
-master_i        -29.94 LUFS   master_tp -9.09 dBTP   gain +15.94   compressor yes
-final           -13.99 LUFS, -1.35 dBTP
+dead runs       23 raw -> 19 bridged -> 12 filtered -> 12 trimmed (15.9 s)
+transcript      1929 words in 112 s (chunked whisper, base)
+disfluency      36 cuts (25 filler, 4 stutter, 7 repeat), 45.8 s removed
+                36 rejected
+segments        54
+output          872.2 s (25.5% removed)
+master_i        -29.91 LUFS   master_tp -9.09 dBTP   gain +15.91   compressor yes
+final           -13.91 LUFS, -1.79 dBTP
 ```
 
-Verification (all PASS): duration 902.08 s vs plan 901.88 s (**+0.20 s**),
-faststart, loudness −13.99 LUFS, splice clicks **0 / 44** (worst 0.0433 vs
-p99.9 0.1087), a/v sync **worst 0.986 over 7**.
+Verification (all PASS): duration 872.46 s vs plan 872.19 s (**+0.26 s**),
+faststart, loudness −13.91 LUFS, splice clicks **0 / 53** (worst 0.0068 vs
+p99.9 0.1090, pre-limiter 0.0647), a/v sync **worst 0.967 over 7**.
 
-**0 clicks at 44 splices, 17 of them inside speech**, is the evidence that
+**0 clicks at 53 splices, 36 of them inside speech**, is the evidence that
 cutting inside speech is safe here.
 
-Before M11 the same file gave 28 segments / 925.1 s / 0 clicks at 27 splices.
+What the pad change cost, measured on this file: 60 -> 54 segments,
+867.4 s -> 872.2 s output. Fewer short gaps survive to be collapsed, so ~5 s
+less is removed. That is the price of not clipping words.
 
 ### brainclean_extension.mp4 (86.77 s, 1920x1080@60, −24.04 LUFS)
 
 ```
 gain            +1.04 dB     peak 0.9035, 0 over
 grid_len        4337
-grid speech     74.7%  -> 82.7% -> 82.7% (0) -> 97.6%
+grid speech     74.7%  -> 82.7% -> 82.7% (0) -> 99.7%
 crop            1068:792:276:240
 freezes         7 blocks, 84.4 s (97.2%)
-dead            2.4%
-dead runs       5 raw -> 5 bridged -> 1 filtered -> 1 trimmed (0.2 s)
+dead            0.3%
+dead runs       1 raw -> 1 bridged -> 0 filtered
+transcript      201 words in 101 s
+disfluency      1 cut (1 filler), 0.2 s removed, 0 rejected
 segments        2
-output          86.3 s (0.6% removed)
-master_i        -24.16 LUFS   master_tp -4.15 dBTP   gain +10.16   compressor yes
-final           -14.06 LUFS, -1.33 dBTP        (two-pass; single-pass gave -14.16, FAIL)
+output          86.5 s (0.3% removed)
+master_i        -24.17 LUFS   master_tp -4.15 dBTP   gain +10.17   compressor yes
+final           -14.20 LUFS, -1.80 dBTP
 ```
 
-Verification (all PASS): duration 86.30 s vs plan 86.27 s (**+0.04 s**),
-faststart, loudness −14.06 LUFS, splice clicks **0 / 1** (worst 0.0003 vs
-p99.9 0.2068), a/v sync **worst 0.999 over 7**. Before two-pass mastering this
-file **failed loudness at −14.16** and the export was refused — that genuine
-failure is also what proved a failed check blocks the export.
+Verification (all PASS): duration 86.60 s vs plan 86.54 s (**+0.07 s**),
+faststart, loudness −14.20 LUFS, splice clicks **0 / 1**, a/v sync **worst
+0.999 over 7**.
 
-Transcript 201 words; 18 caption cues. **0 disfluency cuts** — 2 candidates
-proposed, both rejected because the splice points were far too loud (−38 dB,
-−41 dB). Correct: this file is 97.6% continuous speech with almost no gaps to
-cut at. The threshold sweep is flat here too (0 sped-up sections at every
-threshold), so calibration reports no signal and uses 0.30.
+**Watch the loudness here.** −14.20 against a −14.0 target is a deviation of
+exactly 0.20, and the tolerance is ±0.2. It passes on the boundary. This file
+has drifted upward as other things changed (−14.06 -> −14.17 -> −14.20) and the
+next nudge in the same direction fails the export. It is the first thing to
+check if this file starts failing.
+
+At 99.7% padded speech there is essentially nothing to cut: the single dead run
+does not clear the 1.00 s floor, so the entire edit is one filler cut. The
+threshold sweep is flat too (0 sped-up sections at every threshold), so
+calibration reports no signal and uses 0.30.
 
 **Python v6 reference produced 86.00 s from this file (0.9% removed).** Two
 independent implementations reaching the same conclusion on a file with
@@ -802,7 +845,7 @@ transfer.
 Note the extension file reads **74.9%** above gate against 74.7% grid speech —
 also a match, but a much higher figure, because continuous narration pulls
 programme loudness up toward the speech level. The edge guard consequently has
-less to bite on: it trimmed 43.5 s on the demo file and 0.2 s on the extension.
+less to bite on: it trimmed 15.9 s on the demo file and 0.0 s on the extension.
 The guard does the most work exactly where there is the most to trim.
 
 ---
@@ -824,19 +867,23 @@ removed. See the M7 section for the full reasoning.
 
 ```
                 Rust            Python v6      gap
-demonstration     901.9 s         845.7 s      56.2 s
-extension          86.3 s          86.00 s      0.3 s
+demonstration     872.2 s         845.7 s      26.5 s
+extension          86.5 s          86.00 s      0.5 s
 ```
 
 The extension is effectively exact. The demonstration was 79 s adrift before
-M11; with disfluency removal built it is **56 s**. We remove 23.2 s in 17 cuts
-against the reference's 27.5 s in 28 — close on seconds, fewer cuts.
+M11 and 56 s after it; the current figure is **26.5 s**. Disfluency removal now
+takes 45.8 s in 36 cuts against the reference's 27.5 s in 28 — we remove *more*
+seconds than the reference here, so the residual gap is dead air, not
+disfluency.
 
-The remaining gap is not yet explained. Two things worth checking before
-chasing thresholds: our transcript is our own Whisper `base` (different words
-from the Python's), and 10 candidates die on the quiet-run guard, which v3 did
-not have. **Do not widen a guard to close this gap** — that is exactly the
-trade the guards exist to prevent.
+Per-kind, against the reference: filler 25 cuts / 12.8 s (ref ~26 / ~17.4 s),
+repeat 7 / 25.9 s (ref 9 / ~40.5 s). Fillers are close in count and short in
+seconds; repeats are short in both.
+
+**Do not widen a guard to close this gap** — that is exactly the trade the
+guards exist to prevent. See issue 11 for why the missing repeats are not
+reachable by tuning.
 
 ### 3. dts warnings on sped segments
 
@@ -896,6 +943,71 @@ The disfluency line prints `-0.0s` when there are zero cuts. Harmless.
 Done in the follow-up session. `plan`, `features`, `render`, `master`, `verify`
 are now separate modules; `main.rs` is imports + `main()` only. Verified
 behaviour-identical on both test files (same numbers, all five checks pass).
+
+### 11. Whisper hides repeats, and we cannot currently find them
+
+**This one is investigated, measured, and closed as not-reachable. Read this
+before trying again — three plausible routes were tested and all three failed.**
+
+The symptom: the speaker says *"...active, pending, **or you just or you just**"*
+and abandons the sentence. Whisper writes `"all you just have created"` — the
+repeat appears **once**. Our repeat detector matches words, so a repeat that
+isn't in the text cannot be found. `MIN_PHRASE` is irrelevant here; the words
+are simply not there.
+
+What was tried:
+
+**A bigger model.** Real `medium` (1.5 GB — note the previous `ggml-medium.bin`
+in `models/` was a copy of base, same md5, because the download URL and the
+filename were written out separately and disagreed; every "medium" run was
+really base). Medium fixes the *words* — "tasks" not "data", "active, pending"
+not "x-tap, fending" — but still collapses the repeat to one copy. 1726 s vs
+160 s for the file. **Model size does not fix this.**
+
+**Shorter whisper chunks.** This *works* — at 10 s chunks both takes survive:
+`"or you just that all you just have created"`. Two problems. Accuracy drops
+("tiles" for "tasks"), and the cost is prohibitive: whisper pads every chunk to
+30 s internally, so cost scales with chunk *count*, not audio length. Measured
+per-chunk cost is flat (~17-23 s), so 10 s chunks on the 19-minute file is
+~130 chunks ≈ 87 min, and 5 s chunks ≈ 2.9 hrs. It is viable only on short
+clips. Worse, the two takes come out spelled *differently* (`"or you just"` /
+`"all you just"`), so exact word matching still fails even when both survive.
+
+**Finding repeats in the waveform.** The idea: skip the text, detect repeats
+acoustically, re-transcribe only those spans to confirm. Measured against the 7
+repeats the text detector already finds, versus 40 samples of ordinary adjacent
+speech:
+
+```
+                  YES (real repeats)   NO (ordinary speech)   overlap
+dsp::similarity   0.664 - 0.837        reaches 0.896          92%
+MFCC + DTW cost   34.3 - 43.2          down to 34.3           40%
+```
+
+`dsp::similarity` sums the spectrum into 24 bands and averages the span, so it
+measures *voice and room*, not words — same speaker, same mic, high score
+whatever was said. It is fine as a confirmation for a repeat the words already
+found, which is its actual job, and useless as a detector.
+
+MFCC+DTW is the right tool in principle (mel-cepstral coefficients describe
+vocal-tract shape rather than pitch or loudness; DTW allows the second take to
+run faster) and it did halve the overlap. It still failed. A full-file scan
+returned 1 real repeat in 28 candidates, and — decisively — **it could not rank
+the 7 known repeats into its own top results.** Something that cannot find
+repeats we know are there will not find hidden ones.
+
+Why it failed is worth recording: spans were anchored at word boundaries with
+fixed lengths, comparing `[t, t+L]` against `[t+L, t+2L]`. The two takes of a
+real repeat have *different durations*, so that split almost never lands on the
+actual take boundaries. DTW absorbs speed differences *within* a pair; it
+cannot fix a window that is slicing the takes in the wrong places.
+
+The honest next route, if this is ever picked up again, is a proper
+self-similarity matrix over the whole file with diagonal-stripe detection —
+the standard algorithm for this problem, and a real piece of work with no
+guarantee. The exploratory code (`src/mfcc.rs`, `examples/repeat_scan.rs`,
+`examples/chunk_test.rs`) was reverted, not kept; the numbers above are the
+part worth keeping.
 
 ---
 
@@ -957,3 +1069,18 @@ Two places where the distinction needed a judgement call, both recorded here:
 - **rustc's `help:` blocks are local text fixes.** One suggested
   `Result<(), E>` where the real problem was a missing import four lines up.
   Treat them as hints about where the confusion is, not as patches to paste.
+- **Measure whether a signal can work before building on it.** The acoustic
+  repeat detector was killed by a one-hour test: score the cases you know are
+  positive, score the negatives, see whether the two ranges separate. They
+  overlapped 92% and 40%. That hour replaced a week of building something that
+  could not have worked. The test is cheap because it needs no product code —
+  just the measure and two lists.
+- **Change one variable at a time, and check that you did.** A `git stash`
+  quietly parked an unrelated `SNAP_S` edit along with the change under test,
+  so "old code" versus "new code" was really *old code + SNAP 0.35* versus
+  *new code + SNAP 0.25*. The conclusion drawn from it was wrong. `git diff
+  --stat` before trusting a comparison; a file you did not expect to see in
+  that list is the whole answer.
+- **A negative result is worth writing down in full.** Issue 11 exists so the
+  next person does not re-run three dead ends. What it cost to learn is the
+  reason to keep it.
