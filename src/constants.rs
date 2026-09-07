@@ -96,7 +96,7 @@ pub const MIN_SPEECH_S: f64 = 0.25;
 
 /// Speech run extended backwards by this.
 /// So a later cut never lands on a consonant onset.
-pub const PAD_BEFORE_S: f64 = 0.50;
+pub const PAD_BEFORE_S: f64 = 1.50;
 
 /// Speech run extended forwards by this.
 /// Longer than PAD_BEFORE_S because speech trails off rather than stopping.
@@ -274,4 +274,3 @@ pub const SEARCH_WORDS: usize = 40;
 
 /// Accepted cuts must be at least this far apart, not merely non-overlapping.
 pub const CUT_SPACING_S: f64 = 0.08;
-

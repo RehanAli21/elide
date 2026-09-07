@@ -118,7 +118,7 @@ impl Policy {
     /// | prompt | what changes |
     /// | --- | --- |
     /// | "demonstration of my app, for YouTube" | freeze detection on; disfluencies removed; -14 LUFS |
-    /// | "conference talk recording" | `expect_screen=false` — dead air from audio only; disfluencies removed; pause floor higher, a speaker's pauses are rhetorical |
+    /// | "conference talk recording" | `expect_screen=false` — dead air from audio only; disfluencies removed |
     /// | "podcast interview, two people" | disfluencies OFF — natural speech is the product; dead air `Cut` not `Speed`; -16 LUFS |
     /// | "raw gameplay, cut the loading screens" | freeze detection on; `max_speed` high; disfluencies off |
     fn from_genre(g: Genre) -> Policy {
@@ -126,11 +126,19 @@ impl Policy {
         match g {
             Genre::Demo => base,
 
-            // No screen to crop to, so dead air comes from audio alone. A
-            // presenter's pauses are rhetorical — do not shorten the short ones.
+            // No screen to crop to, so dead air comes from audio alone.
+            //
+            // The spec's table also wanted a higher pause floor here, on the
+            // grounds that a presenter's pauses are rhetorical. That knob is
+            // gone: the pause floor is MIN_DEAD_S in constants.rs now. It was
+            // removed from policy because the one time it mattered in practice
+            // it was the wrong tool — a word got clipped because the VAD lost
+            // its last syllable, and raising the pause floor would have hidden
+            // a speech-detection bug behind a pacing knob. How far the VAD
+            // undershoots is a measurement, not a matter of taste, so it does
+            // not belong to the prompt.
             Genre::Talk => Policy {
                 expect_screen: false,
-                pause_floor_s: 1.5,
                 ..base
             },
 
@@ -215,7 +223,6 @@ pub struct Policy {
     pub remove_disfluencies: bool,
     pub dead_air: DeadAir,
     pub max_speed: f64,
-    pub pause_floor_s: f64,
     pub target_lufs: f64,
     pub expect_screen: bool,
     pub captions: bool,
@@ -230,7 +237,6 @@ impl Default for Policy {
             remove_disfluencies: true,
             dead_air: DeadAir::Speed,
             max_speed: 20.0,
-            pause_floor_s: 1.0,
             target_lufs: -14.0,
             expect_screen: true,
             captions: true,
@@ -246,7 +252,6 @@ impl Policy {
     /// This is the ONLY place a policy number becomes legal.
     fn clamp(&mut self) {
         self.max_speed = self.max_speed.clamp(1.0, 20.0);
-        self.pause_floor_s = self.pause_floor_s.clamp(0.3, 1.5);
         self.target_lufs = self.target_lufs.clamp(-23.0, -14.0);
     }
 
@@ -315,7 +320,6 @@ impl Policy {
         Pacing {
             dead_air: self.dead_air,
             max_speed: self.max_speed,
-            pause_floor_s: self.pause_floor_s,
         }
     }
 
@@ -329,12 +333,11 @@ impl Policy {
 
     pub fn summary(&self) -> String {
         format!(
-            "disfluencies {}  dead air {:?}  max speed {:.0}x  pause floor {:.2}s  \
+            "disfluencies {}  dead air {:?}  max speed {:.0}x  \
              target {:.1} LUFS  screen {}  captions {}  [{}]",
             if self.remove_disfluencies { "on" } else { "off" },
             self.dead_air,
             self.max_speed,
-            self.pause_floor_s,
             self.target_lufs,
             self.expect_screen,
             self.captions,
@@ -351,13 +354,11 @@ mod tests {
     fn out_of_range_values_are_clamped_not_honoured() {
         let mut p = Policy {
             max_speed: 999.0,
-            pause_floor_s: 0.0,
             target_lufs: 0.0,
             ..Default::default()
         };
         p.clamp();
         assert_eq!(p.max_speed, 20.0);
-        assert_eq!(p.pause_floor_s, 0.3);
         assert_eq!(p.target_lufs, -14.0);
     }
 
@@ -381,10 +382,6 @@ mod tests {
         let talk = Policy::from_genre(Genre::Talk);
         assert!(!talk.expect_screen, "talk: dead air from audio only");
         assert!(talk.remove_disfluencies, "talk: disfluencies removed");
-        assert!(
-            talk.pause_floor_s > demo.pause_floor_s,
-            "talk: pause floor higher, a speaker's pauses are rhetorical"
-        );
 
         let pod = Policy::from_genre(Genre::Interview);
         assert!(!pod.remove_disfluencies, "podcast: disfluencies OFF");
@@ -406,7 +403,6 @@ mod tests {
         assert_eq!(o.remove_disfluencies, d.remove_disfluencies);
         assert_eq!(o.dead_air, d.dead_air);
         assert_eq!(o.max_speed, d.max_speed);
-        assert_eq!(o.pause_floor_s, d.pause_floor_s);
         assert_eq!(o.target_lufs, d.target_lufs);
         assert_eq!(o.expect_screen, d.expect_screen);
         assert_eq!(o.captions, d.captions);

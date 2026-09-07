@@ -665,16 +665,25 @@ resolved struct is written to `out/policy.json` and `--params` replays it.
 
 ```
 Policy { remove_disfluencies, dead_air: Cut|Speed|Keep, max_speed 1..=20,
-         pause_floor_s 0.3..=1.5, target_lufs -23..=-14,
-         expect_screen, captions, chapters, source }
+         target_lufs -23..=-14, expect_screen, captions, chapters, source }
 ```
 
 Where each field lands: `expect_screen` skips content-region detection and picks
-the `none` signal; `pause_floor_s` is the planner's min-run filter; `dead_air` +
-`max_speed` drive `decide()`; `remove_disfluencies` skips M11; `target_lufs`
-threads through `master()` and `check_loudness()`; `captions` skips M9.
-`chapters` is parsed but unbuilt. `--signal` and `--params` override the prompt;
-`--no-ai` skips the model entirely.
+the `none` signal; `dead_air` + `max_speed` drive `decide()`;
+`remove_disfluencies` skips M11; `target_lufs` threads through `master()` and
+`check_loudness()`; `captions` skips M9. `chapters` is parsed but unbuilt.
+`--signal` and `--params` override the prompt; `--no-ai` skips the model
+entirely.
+
+**`pause_floor_s` was a policy field and is not any more.** The spec lists the
+pause floor as policy, and it was built that way. It came out again after the
+first time it actually mattered: a word was clipped at 6.56 s on the demo,
+traced to Silero losing the last syllable — the dead run measured 1.00 s against
+a 1.00 s floor and scraped in. Raising the floor would have hidden it. But how
+far the VAD undershoots is a *measurement*, not a matter of taste, and a pacing
+knob tuned to paper over a detection bug breaks on the next file that
+undershoots by a different amount. The floor is `MIN_DEAD_S` in `constants.rs`,
+one number, used by both the planner and the `trim_edges` clamp.
 
 **The model is asked ONE question: what kind of video is this?** Everything else
 is a table in code. That was not the first design, and the reason it is the
@@ -901,8 +910,7 @@ widen a guard could talk the pipeline into destroying the audio and would score
 itself higher for doing it.
 
 **Policy is what the prompt sets.** Whether to remove disfluencies, how hard to
-compress dead air, target loudness, pause floor, `expect_screen`,
-`face_bubble`.
+compress dead air, target loudness, `expect_screen`, `face_bubble`.
 
 `QUIET_DB` and `GATE_DB` are *derived* from `TARGET_LUFS` in `constants.rs`
 rather than written as −44.78 and −38.78, so the coupling is in the code
@@ -915,11 +923,16 @@ policy field stops being clamped.
 
 Two places where the distinction needed a judgement call, both recorded here:
 
-* **`MIN_DEAD_S` does two jobs.** As the planner's floor it is pacing, so the
-  prompt sets it (`pause_floor_s`). As the clamp inside `trim_edges` — *never
-  shrink a run below this* — it is a safety invariant, so it stays a constant.
-  Splitting it was the whole point; leaving it as one number would have let a
-  prompt reach the invariant.
+* **`MIN_DEAD_S` is a constant, and the argument for splitting it was wrong.**
+  It was briefly split: the planner's floor became policy (`pause_floor_s`)
+  while the `trim_edges` clamp stayed a constant. The reasoning sounded fine —
+  pacing is taste, the clamp is safety. It did not survive contact with a real
+  bug. A clipped word traced back to a dead run of exactly 1.00 s against a
+  1.00 s floor, and the tempting fix was to raise the floor. That would have
+  been tuning a taste knob to hide a VAD miss. **Test for "is this policy?":
+  can a user's description tell you the right value?** For loudness and
+  disfluencies, yes. For the pause floor, no — the right value depends on how
+  far the VAD undershot on this file, which is measured, not described.
 * **`target_lufs` is policy, its tolerance is not.** The prompt picks the
   delivery target within −23..−14. The ±0.2 LUFS that `check_loudness` accepts
   is fixed whatever target is asked for, because it describes what single-pass

@@ -11,7 +11,7 @@ use elide::captions::{write_srt, Word};
 use elide::cli::Cli;
 use elide::constants::{
     ACTIVITY_MIN, BRIDGE_GAP_S, DEAD_BRIDGE_S, EDGE_SMOOTH_S, ENERGY_S, GATE_DB, GRID_H, GRID_S, GRID_W, HIGHPASS_HZ,
-    MASTER_TP, MAX_BUSY, MIN_BLOB, MIN_SPEECH_S, PAD_AFTER_S, PAD_BEFORE_S,
+    MASTER_TP, MAX_BUSY, MIN_BLOB, MIN_DEAD_S, MIN_SPEECH_S, PAD_AFTER_S, PAD_BEFORE_S,
     QUIET_DB, SAMPLES_PER_SLICE, SAMPLE_RATE, TARGET_LUFS, VAD_CHUNK, VAD_ENTER, VAD_EXIT,
 };
 use elide::crop::{blobs, bounding_box, busy_fraction, cell_activity, content_mask, sample_frames};
@@ -580,18 +580,16 @@ fn main() -> Result<()> {
     let runs = bridge_dead(&runs, &padded, DEAD_BRIDGE_S);
     println!("            {} after bridging", runs.len());
 
-    // The planner's floor is POLICY — a speaker whose pauses are rhetorical
-    // wants a higher one. The clamp inside trim_edges stays on MIN_DEAD_S:
-    // that one is a safety invariant (never delete a run outright), not pacing.
-    let min_dead_slices = (policy.pause_floor_s / GRID_S) as usize;
+    // The planner's floor is a CONSTANT, not policy. Same number as the clamp
+    // inside trim_edges, which is how it was before the policy layer.
+    let min_dead_slices = (MIN_DEAD_S / GRID_S) as usize;
     let runs: Vec<_> = runs
         .into_iter()
         .filter(|&(a, b)| b - a >= min_dead_slices)
         .collect();
     println!(
-        "            {} after pause floor ({:.2}s)",
-        runs.len(),
-        policy.pause_floor_s
+        "            {} after min_dead filter ({MIN_DEAD_S:.2}s)",
+        runs.len()
     );
 
     let before: usize = runs.iter().map(|&(a, b)| b - a).sum();
@@ -603,7 +601,7 @@ fn main() -> Result<()> {
         (before - after) as f64 * GRID_S
     );
 
-    let floor = policy.pause_floor_s;
+    let floor = MIN_DEAD_S;
     let split = if policy.dead_air == DeadAir::Speed {
         4.0
     } else {

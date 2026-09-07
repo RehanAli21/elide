@@ -92,8 +92,6 @@ pub enum DeadAir {
 pub struct Pacing {
     pub dead_air: DeadAir,
     pub max_speed: f64,
-    /// the planner's floor: runs shorter than this are left alone
-    pub pause_floor_s: f64,
 }
 
 impl Default for Pacing {
@@ -101,13 +99,18 @@ impl Default for Pacing {
         Pacing {
             dead_air: DeadAir::Speed,
             max_speed: 20.0,
-            pause_floor_s: MIN_DEAD_S,
         }
     }
 }
 
 pub fn decide(len_s: f64, p: Pacing) -> Action {
-    if len_s < p.pause_floor_s {
+    // The floor is MIN_DEAD_S, a constant, NOT policy. It was briefly a policy
+    // field. It came back here because the only time it mattered in practice it
+    // was the wrong tool: a word was clipped because the VAD lost its last
+    // syllable, and raising the floor would have hidden a speech-detection bug
+    // behind a pacing knob. How far the VAD undershoots is a measurement, not
+    // a matter of taste.
+    if len_s < MIN_DEAD_S {
         return Action::Keep;
     }
     match p.dead_air {

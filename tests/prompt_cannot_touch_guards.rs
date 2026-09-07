@@ -64,7 +64,7 @@ fn every_numeric_policy_field_is_clamped() {
     let start = text.find("fn clamp").expect("policy.rs has no clamp");
     let body = &text[start..start + text[start..].find("\n    }").expect("unclosed clamp")];
 
-    for field in ["max_speed", "pause_floor_s", "target_lufs"] {
+    for field in ["max_speed", "target_lufs"] {
         assert!(
             body.contains(&format!("self.{field}")),
             "{field} is settable from the prompt but never clamped:\n{body}"
