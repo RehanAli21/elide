@@ -15,9 +15,10 @@ layer), and **M14** (prompt → policy). M10 was deliberately skipped until ther
 is a GUI.
 
 Most recently: `PAD_BEFORE_S` was raised 0.50 → 1.50 to stop a word being
-clipped, `pause_floor_s` was removed from policy back into `constants.rs`, and
-an investigation into the repeats Whisper hides was measured and closed as
-not-reachable (issue 11).
+clipped, `pause_floor_s` was removed from policy back into `constants.rs`, an
+investigation into the repeats Whisper hides was measured and closed as
+not-reachable (issue 11), and every `?` was replaced with an explicit `match`
+while an audit fixed seven places that swallowed errors silently (issue 12).
 
 The pipeline runs end to end with no outside files: it transcribes itself,
 cuts dead air *and* disfluencies, masters, writes captions, and verifies.
@@ -1009,6 +1010,50 @@ guarantee. The exploratory code (`src/mfcc.rs`, `examples/repeat_scan.rs`,
 `examples/chunk_test.rs`) was reverted, not kept; the numbers above are the
 part worth keeping.
 
+### 12. Error handling — RESOLVED
+
+**No `?` anywhere.** All 113 were rewritten as explicit `match`, each error arm
+carrying its own message. `?` was already deterministic — it is exactly
+`match x { Ok(v) => v, Err(e) => return Err(e.into()) }` — so this changed no
+behaviour: both test files give identical numbers before and after, all five
+checks passing with the same values. What it bought is that every failure path
+is written out and says in words which step failed.
+
+The symptom that prompted it — "an error happened and the program kept going
+with no message" — was **not** caused by `?`, which always stops. It was
+caused by code that turned a failure into a default and carried on. An audit
+of every `.unwrap_or*`, `.ok()`, `if let Ok` and `None => continue` found these,
+now fixed:
+
+| where | what went wrong silently | now |
+| --- | --- | --- |
+| `freeze.rs` | an unreadable `freeze_end` left its freeze open; `paint_freezes` paints an open freeze **to the end of the file**, so everything after it became dead air to cut | hard error — also for a start while one is open, an end with no start, and a double end |
+| `verify.rs` `check_sync` | `worst` folds from 1.0, so with every checkpoint skipped it read a perfect 1.000 and **passed having checked nothing** | zero checkpoints is a FAIL; skipped ones are counted in the detail |
+| `verify.rs` `ssim` | the one ffmpeg call that never checked its exit code | checked; the real ffmpeg error is reported |
+| `verify.rs` `check_clicks` | `segments.len() - 1` wraps to a huge number in a release build if there are no segments | `saturating_sub` |
+| `main.rs` proofread | read `captions.srt` with `unwrap_or_default()`, **and read it even with captions off** — so it could proofread a stale file an earlier run left in the folder | only read when captions are on; a failed read prints a warning |
+| `align.rs` | a missing segment, missing token or unreadable token text made the word vanish from the transcript | still skipped (one bad token should not abort a 20-minute run) but prints a warning with the time |
+| `policy.rs` | genre classification fell back to defaults without saying why | warning says whether the model was unreachable or replied with something unreadable |
+
+Also fixed on the way: `measure_loudness` reported a failure as "failed to
+extract audio", a copy-paste of the wrong message; and the ffprobe error said
+"fffmpeg".
+
+Deliberately left as defaults, because the default is the correct answer and
+not a hidden failure:
+
+- `paint_freezes` treating the last open freeze as running to the end — the
+  video ends frozen. Rewritten as a `match` with a comment, and now safe
+  because `detect_freezes` guarantees only the last freeze can be open.
+- The AI capability probe (`capabilities.rs`) scoring a failed call as a miss,
+  via `if let Ok`, and the monitor's `.unwrap_or(true)` on unreadable output
+  (`tasks.rs`). Both are the documented fallbacks and were **left unchanged** —
+  they contain no `?`, so the rewrite did not touch them.
+
+The guard against regressions is `#![deny(unused_must_use)]` in both `lib.rs`
+and `main.rs`: calling a fallible function and ignoring its `Result` — the
+original "forgot the `?`" bug — is now a compile error anywhere in the crate.
+
 ---
 
 ## Guards vs policy
@@ -1063,9 +1108,18 @@ Two places where the distinction needed a judgement call, both recorded here:
 - **A print that never changes is a print that isn't measuring what you think.**
   The smoothing bug hid for two rounds because the distribution being printed
   read the raw array while the guard read the smoothed one.
-- **`?` on every fallible call.** A missing `?` on `concat_segments` made a
-  failing ffmpeg invocation silently succeed. `#![deny(unused_must_use)]` at
-  the top of `main.rs` turns that into a build error.
+- **Every fallible call is a `match`, and an ignored `Result` does not build.**
+  A missing `?` on `concat_segments` once made a failing ffmpeg invocation
+  silently succeed. The codebase now uses no `?` at all — each call is an
+  explicit `match` with its own message in the error arm — and
+  `#![deny(unused_must_use)]` sits at the top of **both** `lib.rs` and
+  `main.rs`, so dropping a `Result` anywhere is a compile error. (It used to be
+  `#[deny]` on `fn main` alone, which covered nothing else in the crate.)
+- **`?` was never the thing hiding errors — defaults were.** When a run
+  "failed with no error", the cause was `.unwrap_or_default()`, `.ok()`,
+  `if let Ok(..)` and `None => continue`: code that turns a failure into a
+  default value and carries on. Those are the lines to audit. See
+  "Error handling" under Open issues for the ones that were found.
 - **rustc's `help:` blocks are local text fixes.** One suggested
   `Result<(), E>` where the real problem was a missing import four lines up.
   Treat them as hints about where the confusion is, not as patches to paste.
