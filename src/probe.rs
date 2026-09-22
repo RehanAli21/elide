@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use serde::Deserialize;
 use std::process::Command;
 
@@ -33,21 +33,40 @@ pub fn ffprobe_json(input: &str) -> Result<String> {
             "-show_streams",
         ])
         .arg(input)
-        .output()
-        .context("could not run ffprobe. Is fffmpeg installed and on PATH?")?;
+        .output();
+    let out = match out {
+        Ok(o) => o,
+        Err(e) => {
+            return Err(anyhow::Error::from(e).context("could not run ffprobe. Is ffmpeg installed and on PATH?"));
+        }
+    };
 
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         bail!("ffprobe failed on {input}: {}", stderr.trim());
     }
 
-    String::from_utf8(out.stdout).context("ffprobe returned invalid UTF-8")
+    match String::from_utf8(out.stdout) {
+        Ok(s) => Ok(s),
+        Err(e) => Err(anyhow::Error::from(e).context("ffprobe returned invalid UTF-8")),
+    }
 }
 
+/// "60000/1001" -> 59.94. None if the text is not a readable fraction; the
+/// caller turns that into an error with its own message.
 pub fn parse_fps(s: &str) -> Option<f64> {
-    let (num, den) = s.split_once('/')?;
-    let num: f64 = num.parse().ok()?;
-    let den: f64 = den.parse().ok()?;
+    let (num, den) = match s.split_once('/') {
+        Some(pair) => pair,
+        None => return None,
+    };
+    let num: f64 = match num.parse() {
+        Ok(v) => v,
+        Err(_) => return None,
+    };
+    let den: f64 = match den.parse() {
+        Ok(v) => v,
+        Err(_) => return None,
+    };
     if den == 0.0 {
         return None;
     }

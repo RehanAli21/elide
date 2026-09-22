@@ -1,3 +1,8 @@
+// A `Result` that is called and then ignored is an error that vanishes: the
+// program carries on as if the step worked. This makes every such case a BUILD
+// error, in every module — not a warning, and not only inside `main`.
+#![deny(unused_must_use)]
+
 pub mod align;
 pub mod audio;
 pub mod captions;

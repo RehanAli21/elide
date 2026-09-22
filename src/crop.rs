@@ -1,17 +1,22 @@
 use crate::constants::{ACTIVITY_MIN, ACTIVITY_RATIO, BUSY_DIFF, GRID_H, GRID_W, SAMPLE_FRAMES};
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use std::process::Command;
 
 pub fn sample_frames(input: &str, duration: f64) -> Result<Vec<Vec<u8>>> {
     let fps = SAMPLE_FRAMES as f64 / duration;
     let filter = format!("fps={fps},scale=160:90,format=gray");
 
-    let out = Command::new("ffmpeg")
+    let out = match Command::new("ffmpeg")
         .args([
             "-i", input, "-vf", &filter, "-an", "-f", "rawvideo", "-pix_fmt", "gray", "-",
         ])
         .output()
-        .context("could not run ffmpeg. Is it installed and on PATH?")?;
+    {
+        Ok(o) => o,
+        Err(e) => {
+            return Err(anyhow::Error::from(e).context("could not run ffmpeg. Is it installed and on PATH?"));
+        }
+    };
 
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);

@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::process::Command;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 
 use crate::constants::{COMPRESSOR, HIGHPASS_HZ, LIMITER_CEILING, LIMITER_COMP, MASTER_TP};
 
@@ -51,8 +51,11 @@ pub fn master(input: &Path, out: &Path, compress: bool, target_lufs: f64) -> Res
             "pcm_s16le",
         ])
         .arg(out)
-        .output()
-        .context("could not run ffmpeg")?;
+        .output();
+    let o = match o {
+        Ok(o) => o,
+        Err(e) => return Err(anyhow::Error::from(e).context("could not run ffmpeg for mastering")),
+    };
 
     if !o.status.success() {
         bail!(
@@ -78,8 +81,11 @@ pub fn finalize(concat_path: &Path, out_path: &Path) -> Result<()> {
             "+faststart",
         ])
         .arg(out_path)
-        .output()
-        .context("could not run ffmpeg")?;
+        .output();
+    let out = match out {
+        Ok(o) => o,
+        Err(e) => return Err(anyhow::Error::from(e).context("could not run ffmpeg to finalize")),
+    };
 
     if !out.status.success() {
         bail!(

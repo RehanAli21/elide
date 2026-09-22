@@ -1,9 +1,14 @@
+// Every ignored `Result` is a build error — see lib.rs. It used to be scoped to
+// `fn main` alone, which left every helper in this file uncovered.
+#![deny(unused_must_use)]
+
 use std::fs;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Result};
 use clap::Parser;
+use serde::Serialize;
 
 use elide::align::{ensure_model, transcribe_chunked};
 use elide::audio::{extract_audio, measure_loudness, Analysis};
@@ -80,11 +85,37 @@ fn calibrate_threshold(
     }
 }
 
+/// Serialise `value` as pretty JSON and write it to `path`. Both steps can fail
+/// and each says which file it was.
+fn write_json<T: Serialize>(path: &std::path::Path, value: &T) -> Result<()> {
+    let text = match serde_json::to_string_pretty(value) {
+        Ok(t) => t,
+        Err(e) => {
+            return Err(anyhow::Error::from(e).context(format!("could not serialise {}", path.display())));
+        }
+    };
+    match fs::write(path, text) {
+        Ok(()) => Ok(()),
+        Err(e) => Err(anyhow::Error::from(e).context(format!("could not write {}", path.display()))),
+    }
+}
+
+/// Create `dir` and any missing parents.
+fn make_dir(dir: &std::path::Path) -> Result<()> {
+    match fs::create_dir_all(dir) {
+        Ok(()) => Ok(()),
+        Err(e) => Err(anyhow::Error::from(e).context(format!("could not create {}", dir.display()))),
+    }
+}
+
 /// Find the content region — the part of the frame that actually changes.
 /// Returns None when there isn't one, which is what a talking-head recording
 /// looks like: no screen, so no crop and nothing to freeze-detect.
 fn detect_crop(input: &str, duration: f64, width: u32, height: u32) -> Result<Option<String>> {
-    let frames = sample_frames(input, duration)?;
+    let frames = match sample_frames(input, duration) {
+        Ok(f) => f,
+        Err(e) => return Err(e.context("could not sample frames to find the content region")),
+    };
     println!("frames      {}", frames.len());
 
     let activity = cell_activity(&frames);
@@ -154,7 +185,6 @@ fn detect_crop(input: &str, duration: f64, width: u32, height: u32) -> Result<Op
     Ok(Some(format!("{cw}:{ch}:{x}:{y}")))
 }
 
-#[deny(unused_must_use)]
 fn main() -> Result<()> {
     let args = Cli::parse();
 
@@ -175,8 +205,10 @@ fn main() -> Result<()> {
 
     let policy = match &args.params {
         Some(path) => {
-            let p = Policy::from_file(path)
-                .with_context(|| format!("could not read parameter set {path}"))?;
+            let p = match Policy::from_file(path) {
+                Ok(p) => p,
+                Err(e) => return Err(e.context(format!("could not read parameter set {path}"))),
+            };
             println!("policy      replayed from {path}");
             p
         }
@@ -189,42 +221,63 @@ fn main() -> Result<()> {
 
     // Log the resolved struct next to the video, so the run is reproducible and
     // "why did it do that?" has an answer that is not a guess.
-    fs::create_dir_all(&args.output)
-        .with_context(|| format!("could not create {}", args.output))?;
+    match make_dir(std::path::Path::new(&args.output)) {
+        Ok(()) => {}
+        Err(e) => return Err(e),
+    }
     let policy_path = PathBuf::from(&args.output).join("policy.json");
-    fs::write(&policy_path, serde_json::to_string_pretty(&policy)?)
-        .with_context(|| format!("could not write {}", policy_path.display()))?;
+    match write_json(&policy_path, &policy) {
+        Ok(()) => {}
+        Err(e) => return Err(e),
+    }
     println!("            logged to {} (replay: --params)", policy_path.display());
 
     let pacing = policy.pacing();
 
-    let json = ffprobe_json(&args.input)?;
+    let json = match ffprobe_json(&args.input) {
+        Ok(j) => j,
+        Err(e) => return Err(e.context(format!("could not probe {}", args.input))),
+    };
 
-    let probe: Probe = serde_json::from_str(&json)
-        .with_context(|| format!("could not parse ffprobe output for {}", args.input))?;
+    let probe: Probe = match serde_json::from_str(&json) {
+        Ok(p) => p,
+        Err(e) => {
+            return Err(anyhow::Error::from(e)
+                .context(format!("could not parse ffprobe output for {}", args.input)));
+        }
+    };
 
-    let video = probe
-        .streams
-        .iter()
-        .find(|s| s.codec_type == "video")
-        .with_context(|| format!("no video stream in {}", args.input))?;
+    let video = match probe.streams.iter().find(|s| s.codec_type == "video") {
+        Some(v) => v,
+        None => return Err(anyhow!("no video stream in {}", args.input)),
+    };
 
-    let duration: f64 = probe
-        .format
-        .duration
-        .parse()
-        .with_context(|| format!("bad duration {:?}", probe.format.duration))?;
+    let duration: f64 = match probe.format.duration.parse() {
+        Ok(d) => d,
+        Err(e) => {
+            return Err(anyhow::Error::from(e)
+                .context(format!("bad duration {:?}", probe.format.duration)));
+        }
+    };
 
-    let fps = video
-        .r_frame_rate
-        .as_deref()
-        .and_then(parse_fps)
-        .context("could not read frame rate")?;
+    let fps = match video.r_frame_rate.as_deref() {
+        Some(text) => match parse_fps(text) {
+            Some(f) => f,
+            None => return Err(anyhow!("could not read frame rate {text:?}")),
+        },
+        None => return Err(anyhow!("video stream has no frame rate")),
+    };
 
     println!("fps         {fps:.3}");
 
-    let width = video.width.context("video stream has no width")?;
-    let height = video.height.context("video stream has no height")?;
+    let width = match video.width {
+        Some(w) => w,
+        None => return Err(anyhow!("video stream has no width")),
+    };
+    let height = match video.height {
+        Some(h) => h,
+        None => return Err(anyhow!("video stream has no height")),
+    };
 
     println!("duration    {duration:.2} s");
     println!("resolution  {width}x{height}");
@@ -238,12 +291,17 @@ fn main() -> Result<()> {
     }
 
     let temp_dir = PathBuf::from(&args.output).join("temp");
-    fs::create_dir_all(&temp_dir)
-        .with_context(|| format!("could not create {}", temp_dir.display()))?;
+    match make_dir(&temp_dir) {
+        Ok(()) => {}
+        Err(e) => return Err(e),
+    }
 
     let wav_path = temp_dir.join("a16.wav");
 
-    let (input_i, input_tp) = measure_loudness(&args.input, TARGET_LUFS, &[])?;
+    let (input_i, input_tp) = match measure_loudness(&args.input, TARGET_LUFS, &[]) {
+        Ok(v) => v,
+        Err(e) => return Err(e.context("could not measure the input's loudness")),
+    };
 
     let gain_db = TARGET_LUFS - input_i;
 
@@ -251,15 +309,26 @@ fn main() -> Result<()> {
     println!("input_tp    {input_tp:.2} dBTP");
     println!("gain        {gain_db:+.2} dB");
 
-    extract_audio(&args.input, &wav_path, gain_db)?;
+    match extract_audio(&args.input, &wav_path, gain_db) {
+        Ok(()) => {}
+        Err(e) => return Err(e.context("could not extract the analysis audio")),
+    }
 
-    let reader = WavReader::open(&wav_path)
-        .with_context(|| format!("could not open {}", wav_path.display()))?;
+    let reader = match WavReader::open(&wav_path) {
+        Ok(r) => r,
+        Err(e) => {
+            return Err(anyhow::Error::from(e).context(format!("could not open {}", wav_path.display())));
+        }
+    };
 
     let spec = reader.spec();
-    let samples: Vec<f32> = reader
-        .into_samples::<f32>()
-        .collect::<Result<Vec<f32>, _>>()?;
+    let samples: Vec<f32> = match reader.into_samples::<f32>().collect::<Result<Vec<f32>, _>>() {
+        Ok(s) => s,
+        Err(e) => {
+            return Err(anyhow::Error::from(e)
+                .context(format!("could not read samples from {}", wav_path.display())));
+        }
+    };
 
     let secs = samples.len() as f64 / spec.sample_rate as f64;
 
@@ -286,38 +355,63 @@ fn main() -> Result<()> {
     };
 
     let path = temp_dir.join("analysis.json");
-    fs::write(&path, serde_json::to_string_pretty(&analysis)?)
-        .with_context(|| format!("could not write {}", path.display()))?;
+    match write_json(&path, &analysis) {
+        Ok(()) => {}
+        Err(e) => return Err(e),
+    }
 
     // transcript for captions (and, later, disfluency). A supplied --transcript
     // overrides; otherwise we transcribe with chunked whisper.
-    let words: Vec<Word> = if let Some(tpath) = &args.transcript {
-        let raw = fs::read_to_string(tpath)
-            .with_context(|| format!("could not read transcript {tpath}"))?;
-        serde_json::from_str(&raw).context("could not parse transcript JSON")?
-    } else {
-        let model = ensure_model()?;
-        println!("transcribing (chunked whisper)...");
-        let t0 = Instant::now();
-        let w = transcribe_chunked(&samples, spec.sample_rate, &model)?;
-        println!(
-            "transcript  {} words in {:.1}s",
-            w.len(),
-            t0.elapsed().as_secs_f64()
-        );
-        w
+    let words: Vec<Word> = match &args.transcript {
+        Some(tpath) => {
+            let raw = match fs::read_to_string(tpath) {
+                Ok(r) => r,
+                Err(e) => {
+                    return Err(anyhow::Error::from(e).context(format!("could not read transcript {tpath}")));
+                }
+            };
+            match serde_json::from_str(&raw) {
+                Ok(w) => w,
+                Err(e) => {
+                    return Err(anyhow::Error::from(e).context(format!("could not parse transcript JSON {tpath}")));
+                }
+            }
+        }
+        None => {
+            let model = match ensure_model() {
+                Ok(m) => m,
+                Err(e) => return Err(e.context("could not get the whisper model")),
+            };
+            println!("transcribing (chunked whisper)...");
+            let t0 = Instant::now();
+            let w = match transcribe_chunked(&samples, spec.sample_rate, &model) {
+                Ok(w) => w,
+                Err(e) => return Err(e.context("transcription failed")),
+            };
+            println!(
+                "transcript  {} words in {:.1}s",
+                w.len(),
+                t0.elapsed().as_secs_f64()
+            );
+            w
+        }
     };
 
     // keep the transcript so a re-run can skip whisper via --transcript
     let tpath = temp_dir.join("transcript.json");
-    fs::write(&tpath, serde_json::to_string_pretty(&words)?)
-        .with_context(|| format!("could not write {}", tpath.display()))?;
+    match write_json(&tpath, &words) {
+        Ok(()) => {}
+        Err(e) => return Err(e),
+    }
 
-    let mut vad = VoiceActivityDetector::builder()
+    let mut vad = match VoiceActivityDetector::builder()
         .sample_rate(SAMPLE_RATE)
         .chunk_size(VAD_CHUNK)
         .build()
-        .context("could not build VAD")?;
+    {
+        Ok(v) => v,
+        Err(e) => return Err(anyhow::Error::from(e).context("could not build VAD")),
+    };
 
     let t0 = Instant::now();
     let probs: Vec<f32> = samples
@@ -389,7 +483,10 @@ fn main() -> Result<()> {
     // crop to and nothing to freeze-detect, so we do not spend the frame
     // sampling looking for one.
     let detected = if policy.expect_screen {
-        detect_crop(&args.input, duration, width, height)?
+        match detect_crop(&args.input, duration, width, height) {
+            Ok(d) => d,
+            Err(e) => return Err(e.context("content-region detection failed")),
+        }
     } else {
         println!("crop        skipped (prompt says no screen)");
         None
@@ -408,15 +505,21 @@ fn main() -> Result<()> {
     // M12 — signal B behind a trait. The only per-genre piece; everything
     // downstream is unchanged whichever implementation runs. --signal overrides
     // the prompt; with neither, expect_screen picks it.
-    let signal_name = args.signal.clone().unwrap_or_else(|| {
-        if detected.is_some() {
-            "freeze".to_string()
-        } else {
-            "none".to_string()
-        }
-    });
-    let signal = signal::for_name(&signal_name)?;
-    let frozen = signal.mask(&args.input, &crop, grid_len, duration)?;
+    let signal_name = match &args.signal {
+        Some(s) => s.clone(),
+        None => match detected {
+            Some(_) => "freeze".to_string(),
+            None => "none".to_string(),
+        },
+    };
+    let signal = match signal::for_name(&signal_name) {
+        Ok(s) => s,
+        Err(e) => return Err(e),
+    };
+    let frozen = match signal.mask(&args.input, &crop, grid_len, duration) {
+        Ok(m) => m,
+        Err(e) => return Err(e.context(format!("the '{signal_name}' signal failed"))),
+    };
 
     let frozen_pct = 100.0 * frozen.iter().filter(|&&b| b).count() as f64 / grid_len as f64;
     println!("frozen      {frozen_pct:.1}% of grid  (signal: {})", signal.name());
@@ -748,19 +851,31 @@ fn main() -> Result<()> {
     };
 
     let path = temp_dir.join("plan.json");
-    fs::write(&path, serde_json::to_string_pretty(&plan)?)
-        .with_context(|| format!("could not write {}", path.display()))?;
+    match write_json(&path, &plan) {
+        Ok(()) => {}
+        Err(e) => return Err(e),
+    }
 
     let seg_dir = temp_dir.join("segments");
-    fs::create_dir_all(&seg_dir)
-        .with_context(|| format!("could not create {}", seg_dir.display()))?;
+    match make_dir(&seg_dir) {
+        Ok(()) => {}
+        Err(e) => return Err(e),
+    }
 
     let mut seg_paths = vec![];
     let t0 = Instant::now();
 
     for (i, seg) in segs.iter().enumerate() {
         let path = seg_dir.join(format!("seg_{i:03}.mkv"));
-        render_segments(&args.input, seg, &path)?;
+        match render_segments(&args.input, seg, &path) {
+            Ok(()) => {}
+            Err(e) => {
+                return Err(e.context(format!(
+                    "segment {i} ({:.2}s-{:.2}s at {:.2}x) failed to render",
+                    seg.src_start, seg.src_end, seg.speed
+                )));
+            }
+        }
         seg_paths.push(path);
     }
 
@@ -777,19 +892,33 @@ fn main() -> Result<()> {
         list.push_str(&format!("file '{}'\n", p.display()));
     }
 
-    fs::write(&list_path, list)
-        .with_context(|| format!("could not write {}", list_path.display()))?;
+    match fs::write(&list_path, list) {
+        Ok(()) => {}
+        Err(e) => {
+            return Err(anyhow::Error::from(e).context(format!("could not write {}", list_path.display())));
+        }
+    }
 
     let concat_path = temp_dir.join("concat.mkv");
-    concat_segments(&list_path, &concat_path)?;
+    match concat_segments(&list_path, &concat_path) {
+        Ok(()) => {}
+        Err(e) => return Err(e.context("could not join the rendered segments")),
+    }
 
     // --- M6: master ---
     let highpass = format!("highpass=f={HIGHPASS_HZ}");
-    let (master_i, master_tp) = measure_loudness(
-        concat_path.to_str().context("non-UTF-8 path")?,
+    let concat_str = match concat_path.to_str() {
+        Some(p) => p,
+        None => return Err(anyhow!("non-UTF-8 path: {}", concat_path.display())),
+    };
+    let (master_i, master_tp) = match measure_loudness(
+        concat_str,
         policy.target_lufs,
         &[&highpass, "afftdn=nr=12:nf=-45"],
-    )?;
+    ) {
+        Ok(v) => v,
+        Err(e) => return Err(e.context("could not measure loudness before mastering")),
+    };
 
     let master_gain = policy.target_lufs - master_i;
     let would_clip = master_tp + master_gain > MASTER_TP;
@@ -800,26 +929,48 @@ fn main() -> Result<()> {
     println!("compressor  {}", if would_clip { "yes" } else { "no" });
 
     let master_path = temp_dir.join("master.mkv");
-    master(&concat_path, &master_path, would_clip, policy.target_lufs)?;
+    match master(&concat_path, &master_path, would_clip, policy.target_lufs) {
+        Ok(()) => {}
+        Err(e) => return Err(e.context("mastering failed")),
+    }
 
     let out_path = PathBuf::from(&args.output).join("out.mp4");
-    finalize(&master_path, &out_path)?;
+    match finalize(&master_path, &out_path) {
+        Ok(()) => {}
+        Err(e) => return Err(e.context("could not write out.mp4")),
+    }
     println!("wrote       {}", out_path.display());
 
     // M9 — captions, scaled to the real output duration (fixes the drift)
-    let out_json = ffprobe_json(out_path.to_str().context("non-UTF-8 path")?)?;
-    let out_probe: Probe =
-        serde_json::from_str(&out_json).context("could not parse ffprobe output for out.mp4")?;
-    let measured: f64 = out_probe
-        .format
-        .duration
-        .parse()
-        .context("bad out.mp4 duration")?;
+    let out_str = match out_path.to_str() {
+        Some(p) => p,
+        None => return Err(anyhow!("non-UTF-8 path: {}", out_path.display())),
+    };
+    let out_json = match ffprobe_json(out_str) {
+        Ok(j) => j,
+        Err(e) => return Err(e.context("could not probe out.mp4")),
+    };
+    let out_probe: Probe = match serde_json::from_str(&out_json) {
+        Ok(p) => p,
+        Err(e) => {
+            return Err(anyhow::Error::from(e).context("could not parse ffprobe output for out.mp4"));
+        }
+    };
+    let measured: f64 = match out_probe.format.duration.parse() {
+        Ok(d) => d,
+        Err(e) => {
+            return Err(anyhow::Error::from(e)
+                .context(format!("bad out.mp4 duration {:?}", out_probe.format.duration)));
+        }
+    };
     let scale = measured / plan.out_duration_s;
 
     let srt_path = PathBuf::from(&args.output).join("captions.srt");
     if policy.captions {
-        let n = write_srt(&words, &plan, scale, &srt_path)?;
+        let n = match write_srt(&words, &plan, scale, &srt_path) {
+            Ok(n) => n,
+            Err(e) => return Err(e.context("could not write captions")),
+        };
         println!(
             "captions    {n} cues -> {} (scale {scale:.5})",
             srt_path.display()
@@ -828,7 +979,10 @@ fn main() -> Result<()> {
         println!("captions    off (prompt)");
     }
 
-    let checks = verify(&args.input, &out_path, &temp_dir, &plan, policy.target_lufs)?;
+    let checks = match verify(&args.input, &out_path, &temp_dir, &plan, policy.target_lufs) {
+        Ok(c) => c,
+        Err(e) => return Err(e.context("verification could not run")),
+    };
 
     println!("\nverification:");
     for c in &checks {
@@ -843,11 +997,29 @@ fn main() -> Result<()> {
     // M13 — the safest AI task: flag caption lines a human should proofread.
     // It edits nothing, so a wrong answer costs nothing. Triage runs first, so
     // only the risky-looking lines cost a call.
-    let cap_lines: Vec<String> = fs::read_to_string(&srt_path)
-        .unwrap_or_default()
-        .split("\n\n")
-        .filter_map(|cue| cue.lines().nth(2).map(str::to_string))
-        .collect();
+    //
+    // Two fixes here. It read the file with `unwrap_or_default()`, so a failed
+    // read became an empty string and proofread silently did nothing. And it
+    // read the file even with captions OFF — this run wrote no captions.srt, so
+    // it would pick up a STALE one left in the output folder by an earlier run
+    // and proofread captions that do not belong to this video.
+    let cap_lines: Vec<String> = if policy.captions {
+        match fs::read_to_string(&srt_path) {
+            Ok(text) => text
+                .split("\n\n")
+                .filter_map(|cue| cue.lines().nth(2).map(str::to_string))
+                .collect(),
+            Err(e) => {
+                eprintln!(
+                    "warning: proofread skipped — could not read {}: {e}",
+                    srt_path.display()
+                );
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
 
     // Reuses the provider probed at the top of the run — one probe, not two.
     if let (false, Some((provider, caps))) = (cap_lines.is_empty(), &ai) {

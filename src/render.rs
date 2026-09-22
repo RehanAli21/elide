@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::process::Command;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 
 use crate::constants::ATEMPO_MAX;
 use crate::plan::Segment;
@@ -62,7 +62,10 @@ pub fn render_segments(input: &str, seg: &Segment, out_path: &Path) -> Result<()
     ]);
     cmd.arg(out_path);
 
-    let out = cmd.output().context("could not run ffmpeg")?;
+    let out = match cmd.output() {
+        Ok(o) => o,
+        Err(e) => return Err(anyhow::Error::from(e).context("could not run ffmpeg to render a segment")),
+    };
     if !out.status.success() {
         bail!(
             "ffmpeg failed on segment: {}",
@@ -78,8 +81,11 @@ pub fn concat_segments(list_path: &Path, out_path: &Path) -> Result<()> {
         .arg(list_path)
         .args(["-c", "copy"])
         .arg(out_path)
-        .output()
-        .context("could not run ffmpeg")?;
+        .output();
+    let out = match out {
+        Ok(o) => o,
+        Err(e) => return Err(anyhow::Error::from(e).context("could not run ffmpeg to concat segments")),
+    };
 
     if !out.status.success() {
         bail!(

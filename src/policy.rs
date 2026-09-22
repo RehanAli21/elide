@@ -268,9 +268,24 @@ impl Policy {
             "Pick exactly one option by index.\n\nSITUATION: {prompt}\n\n\
              QUESTION: What kind of video is this?\n\nOPTIONS: {GENRE_OPTIONS}\n\nReply JSON."
         );
-        let raw = provider.complete(&ask, Some(&schema), 50, 0.0).ok()?;
-        let i = serde_json::from_str::<Choice>(&raw).ok()?.index;
-        Some(Genre::from_index(i))
+        // Either failure falls back to defaults — by design, the tool must run
+        // with no model. But it says WHY, so "defaults" in the log is never a
+        // mystery: unreachable and unreadable are different problems.
+        let raw = match provider.complete(&ask, Some(&schema), 50, 0.0) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("warning: genre classification failed ({e}); using default policy");
+                return None;
+            }
+        };
+        let choice = match serde_json::from_str::<Choice>(&raw) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("warning: model replied {raw:?}, not a genre index ({e}); using default policy");
+                return None;
+            }
+        };
+        Some(Genre::from_index(choice.index))
     }
 
     /// Resolve a prompt into policy. Falls back to defaults, loudly, whenever
@@ -325,8 +340,16 @@ impl Policy {
 
     /// Replay an exact parameter set.
     pub fn from_file(path: &str) -> Result<Policy> {
-        let raw = std::fs::read_to_string(path)?;
-        let mut p: Policy = serde_json::from_str(&raw)?;
+        let raw = match std::fs::read_to_string(path) {
+            Ok(r) => r,
+            Err(e) => return Err(anyhow::Error::from(e).context(format!("could not read {path}"))),
+        };
+        let mut p: Policy = match serde_json::from_str(&raw) {
+            Ok(p) => p,
+            Err(e) => {
+                return Err(anyhow::Error::from(e).context(format!("{path} is not a valid policy file")));
+            }
+        };
         p.clamp(); // a hand-edited file is still not allowed out of range
         Ok(p)
     }

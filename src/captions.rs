@@ -10,7 +10,7 @@
 use std::fs;
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::plan::{map_to_output, Plan};
@@ -109,8 +109,12 @@ pub fn write_srt(words: &[Word], plan: &Plan, scale: f64, out_path: &Path) -> Re
         out.push_str(&format!("{}\n{} --> {}\n{body}\n\n", i + 1, ts(*s), ts(*e)));
     }
 
-    fs::write(out_path, out)
-        .with_context(|| format!("could not write {}", out_path.display()))?;
+    match fs::write(out_path, out) {
+        Ok(()) => {}
+        Err(e) => {
+            return Err(anyhow::Error::from(e).context(format!("could not write {}", out_path.display())));
+        }
+    }
 
     Ok(frags.len())
 }

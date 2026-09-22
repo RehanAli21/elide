@@ -36,10 +36,20 @@ impl DeadTimeSignal for Freeze {
     }
 
     fn mask(&self, input: &str, crop: &str, grid_len: usize, duration: f64) -> Result<Vec<bool>> {
-        let freezes = detect_freezes(input, crop)?;
+        let freezes = match detect_freezes(input, crop) {
+            Ok(f) => f,
+            Err(e) => return Err(e.context("freeze detection failed")),
+        };
         let total: f64 = freezes
             .iter()
-            .map(|&(s, e)| e.unwrap_or(duration) - s)
+            .map(|&(s, e)| {
+                // open = the video ends while frozen (only the last can be)
+                let end = match e {
+                    Some(t) => t,
+                    None => duration,
+                };
+                end - s
+            })
             .sum();
         println!(
             "freezes     {} blocks, {total:.1} s frozen ({:.1}%)",
@@ -74,7 +84,10 @@ impl DeadTimeSignal for Slides {
     fn mask(&self, input: &str, _crop: &str, grid_len: usize, duration: f64) -> Result<Vec<bool>> {
         // Whole frame, not the content crop: a slide fills the frame, and there
         // is no app window to isolate.
-        let frames = sample_frames(input, duration)?;
+        let frames = match sample_frames(input, duration) {
+            Ok(f) => f,
+            Err(e) => return Err(e.context("slide detection could not sample frames")),
+        };
         if frames.len() < 2 {
             bail!("slide detection needs at least 2 sampled frames");
         }

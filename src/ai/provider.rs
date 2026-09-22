@@ -118,7 +118,7 @@ impl LlmProvider for Ollama {
             body["format"] = s.clone();
         }
 
-        let out = Command::new("curl")
+        let out = match Command::new("curl")
             .args([
                 "-s",
                 "-m",
@@ -131,12 +131,21 @@ impl LlmProvider for Ollama {
                 "-d",
                 &body.to_string(),
             ])
-            .output()?;
+            .output()
+        {
+            Ok(o) => o,
+            Err(e) => return Err(anyhow::Error::from(e).context("could not run curl")),
+        };
 
         if !out.status.success() {
             bail!("provider unreachable");
         }
-        let envelope: GenResponse = serde_json::from_slice(&out.stdout)?;
+        let envelope: GenResponse = match serde_json::from_slice(&out.stdout) {
+            Ok(v) => v,
+            Err(e) => {
+                return Err(anyhow::Error::from(e).context("provider replied with unreadable JSON"));
+            }
+        };
         Ok(envelope.response)
     }
 }

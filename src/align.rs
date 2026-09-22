@@ -10,7 +10,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Result};
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
 use crate::captions::Word;
@@ -23,17 +23,27 @@ const MODEL_URL: &str = "https://huggingface.co/ggerganov/whisper.cpp/resolve/ma
 /// and return its path.
 pub fn ensure_model() -> Result<PathBuf> {
     let dir = Path::new("models");
-    fs::create_dir_all(dir).with_context(|| format!("could not create {}", dir.display()))?;
+    match fs::create_dir_all(dir) {
+        Ok(()) => {}
+        Err(e) => {
+            return Err(anyhow::Error::from(e).context(format!("could not create {}", dir.display())));
+        }
+    }
 
     let path = dir.join("ggml-base.bin");
     if !path.exists() {
         println!("downloading whisper model (base, ~148MB)...");
-        let status = Command::new("curl")
+        let status = match Command::new("curl")
             .args(["-L", "-f", "-o"])
             .arg(&path)
             .arg(MODEL_URL)
             .status()
-            .context("could not run curl to download the model")?;
+        {
+            Ok(s) => s,
+            Err(e) => {
+                return Err(anyhow::Error::from(e).context("could not run curl to download the model"));
+            }
+        };
         if !status.success() {
             bail!("whisper model download failed");
         }
@@ -48,12 +58,18 @@ pub fn transcribe_chunked(samples: &[f32], sample_rate: u32, model: &Path) -> Re
     // so it is dropped instead of flooding stdout
     whisper_rs::install_logging_hooks();
 
-    let ctx = WhisperContext::new_with_params(
-        model.to_str().context("non-UTF-8 model path")?,
-        WhisperContextParameters::default(),
-    )
-    .context("could not load whisper model")?;
-    let mut state = ctx.create_state().context("could not create whisper state")?;
+    let model_path = match model.to_str() {
+        Some(p) => p,
+        None => return Err(anyhow!("non-UTF-8 model path: {}", model.display())),
+    };
+    let ctx = match WhisperContext::new_with_params(model_path, WhisperContextParameters::default()) {
+        Ok(c) => c,
+        Err(e) => return Err(anyhow::Error::from(e).context("could not load whisper model")),
+    };
+    let mut state = match ctx.create_state() {
+        Ok(s) => s,
+        Err(e) => return Err(anyhow::Error::from(e).context("could not create whisper state")),
+    };
 
     let threads = std::thread::available_parallelism()
         .map(|x| x.get() as i32)
@@ -87,16 +103,23 @@ pub fn transcribe_chunked(samples: &[f32], sample_rate: u32, model: &Path) -> Re
         params.set_print_realtime(false);
         params.set_print_timestamps(false);
 
-        state
-            .full(params, seg)
-            .with_context(|| format!("whisper failed on chunk at {cs:.0}s"))?;
+        match state.full(params, seg) {
+            Ok(_) => {}
+            Err(e) => {
+                return Err(anyhow::Error::from(e).context(format!("whisper failed on chunk at {cs:.0}s")));
+            }
+        }
 
         // a word belongs to this chunk if its midpoint is in the chunk's own
         // region (overlap halves are owned by the neighbour)
         let lo = if ci == 0 { cs } else { cs + OVERLAP_S / 2.0 };
         let hi = if ce >= dur { ce } else { ce - OVERLAP_S / 2.0 };
 
-        for w in chunk_words(&state, cs)? {
+        let chunk = match chunk_words(&state, cs) {
+            Ok(w) => w,
+            Err(e) => return Err(e.context(format!("could not read words from chunk at {cs:.0}s"))),
+        };
+        for w in chunk {
             let mid = (w.start + w.end) / 2.0;
             if lo <= mid && mid < hi {
                 out.push(w);
@@ -140,18 +163,38 @@ fn chunk_words(state: &whisper_rs::WhisperState, cs: f64) -> Result<Vec<Word>> {
         text.clear();
     };
 
+    // A segment, token or token text that whisper cannot hand back used to be
+    // skipped in silence — `None => continue`, `unwrap_or_default()` — and the
+    // word simply vanished from the transcript. It still skips (one unreadable
+    // token should not abort a 20-minute transcription), but it now SAYS so,
+    // with the time, so a missing word can be traced.
     let n_segments = state.full_n_segments();
     for si in 0..n_segments {
         let seg = match state.get_segment(si) {
             Some(s) => s,
-            None => continue,
+            None => {
+                eprintln!("warning: whisper segment {si} of chunk at {cs:.0}s is missing; skipped");
+                continue;
+            }
         };
         for ti in 0..seg.n_tokens() {
             let tok = match seg.get_token(ti) {
                 Some(t) => t,
-                None => continue,
+                None => {
+                    eprintln!(
+                        "warning: whisper token {ti} in segment {si} of chunk at {cs:.0}s is missing; skipped"
+                    );
+                    continue;
+                }
             };
-            let piece = tok.to_str_lossy().unwrap_or_default().to_string();
+            let piece = match tok.to_str_lossy() {
+                Ok(s) => s.to_string(),
+                Err(e) => {
+                    let t0 = cs + tok.token_data().t0 as f64 / 100.0;
+                    eprintln!("warning: whisper token at {t0:.2}s could not be read ({e}); word skipped");
+                    continue;
+                }
+            };
             if piece.starts_with('[') {
                 continue; // special token, e.g. [_BEG_]
             }

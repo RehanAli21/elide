@@ -2,7 +2,7 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Result};
 use hound::WavReader;
 
 use crate::audio::measure_loudness;
@@ -17,11 +17,24 @@ pub struct Check {
     pub detail: String,
 }
 
+/// A path as &str, or an error naming it. ffmpeg/ffprobe helpers here take str.
+fn path_str(p: &Path) -> Result<&str> {
+    match p.to_str() {
+        Some(s) => Ok(s),
+        None => Err(anyhow!("non-UTF-8 path: {}", p.display())),
+    }
+}
+
 // ---------------------------------------------------------------- 5. faststart
 
 fn check_faststart(out_path: &Path) -> Result<Check> {
     // read the first 64 KB and look for moov before mdat
-    let bytes = fs::read(out_path).context("could not read output")?;
+    let bytes = match fs::read(out_path) {
+        Ok(b) => b,
+        Err(e) => {
+            return Err(anyhow::Error::from(e).context(format!("could not read {}", out_path.display())));
+        }
+    };
     let head = &bytes[..bytes.len().min(65536)];
 
     let moov = find_atom(head, b"moov");
@@ -47,11 +60,14 @@ fn find_atom(bytes: &[u8], tag: &[u8; 4]) -> Option<usize> {
 // ----------------------------------------------------------------- 4. loudness
 
 fn check_loudness(out_path: &Path, target_lufs: f64) -> Result<Check> {
-    let (i, tp) = measure_loudness(
-        out_path.to_str().context("non-UTF-8 path")?,
-        target_lufs,
-        &[],
-    )?;
+    let path = match path_str(out_path) {
+        Ok(p) => p,
+        Err(e) => return Err(e),
+    };
+    let (i, tp) = match measure_loudness(path, target_lufs, &[]) {
+        Ok(v) => v,
+        Err(e) => return Err(e.context("could not measure the output's loudness")),
+    };
 
     // +/-0.2 LUFS per BUILD_STEPS M7's acceptance criterion. It was 0.1 here,
     // taken from M6's prose describing a typical range rather than the
@@ -79,29 +95,60 @@ fn check_loudness(out_path: &Path, target_lufs: f64) -> Result<Check> {
 fn check_sync(input: &str, out_path: &Path, temp_dir: &Path, plan: &Plan) -> Result<Check> {
     let n = 7;
     let mut scores = Vec::new();
+    let mut skipped = 0;
+
+    let out_str = match path_str(out_path) {
+        Ok(p) => p,
+        Err(e) => return Err(e),
+    };
 
     for k in 1..=n {
         let out_t = plan.out_duration_s * k as f64 / (n + 1) as f64;
         let src_t = match map_to_source(plan, out_t) {
             Some(t) => t,
-            None => continue,
+            None => {
+                eprintln!("warning: sync checkpoint at {out_t:.2}s is outside the plan; skipped");
+                skipped += 1;
+                continue;
+            }
         };
 
         let a = temp_dir.join(format!("sync_out_{k}.png"));
         let b = temp_dir.join(format!("sync_src_{k}.png"));
 
-        grab_frame(out_path.to_str().unwrap(), out_t, &a)?;
-        grab_frame(input, src_t, &b)?;
-
-        scores.push(ssim(&a, &b)?);
+        match grab_frame(out_str, out_t, &a) {
+            Ok(()) => {}
+            Err(e) => return Err(e.context(format!("sync check: output frame at {out_t:.2}s"))),
+        }
+        match grab_frame(input, src_t, &b) {
+            Ok(()) => {}
+            Err(e) => return Err(e.context(format!("sync check: source frame at {src_t:.2}s"))),
+        }
+        match ssim(&a, &b) {
+            Ok(s) => scores.push(s),
+            Err(e) => return Err(e.context(format!("sync check: comparing frames at {out_t:.2}s"))),
+        }
     }
 
+    // Zero checkpoints is a FAIL, not a pass. `worst` folds from 1.0, so with
+    // nothing measured it used to read a perfect 1.000 and pass — a check that
+    // checked nothing reporting success.
     let worst = scores.iter().cloned().fold(1.0f64, f64::min);
+    let passed = !scores.is_empty() && worst >= 0.90;
+
+    let detail = if skipped > 0 {
+        format!(
+            "worst {worst:.3} over {} checkpoints ({skipped} could not be placed)",
+            scores.len()
+        )
+    } else {
+        format!("worst {worst:.3} over {} checkpoints", scores.len())
+    };
 
     Ok(Check {
         name: "a/v sync",
-        passed: worst >= 0.90,
-        detail: format!("worst {worst:.3} over {} checkpoints", scores.len()),
+        passed,
+        detail,
     })
 }
 
@@ -119,8 +166,11 @@ fn grab_frame(input: &str, t: f64, out_path: &Path) -> Result<()> {
             "2",
         ])
         .arg(out_path)
-        .output()
-        .context("could not run ffmpeg")?;
+        .output();
+    let out = match out {
+        Ok(o) => o,
+        Err(e) => return Err(anyhow::Error::from(e).context("could not run ffmpeg to grab a frame")),
+    };
 
     if !out.status.success() {
         bail!(
@@ -138,25 +188,49 @@ fn ssim(a: &Path, b: &Path) -> Result<f64> {
         .args(["-i"])
         .arg(b)
         .args(["-lavfi", "ssim", "-f", "null", "-"])
-        .output()
-        .context("could not run ffmpeg")?;
+        .output();
+    let out = match out {
+        Ok(o) => o,
+        Err(e) => return Err(anyhow::Error::from(e).context("could not run ffmpeg for SSIM")),
+    };
 
     let stderr = String::from_utf8_lossy(&out.stderr);
-    let all = stderr
-        .split("All:")
-        .nth(1)
-        .context("no SSIM in ffmpeg output")?;
-    let value = all.split_whitespace().next().context("bad SSIM output")?;
-    value.parse().context("could not parse SSIM")
+
+    // This was the one ffmpeg call in the project that never checked the exit
+    // code. A failed run still errored further down ("no SSIM in output"), but
+    // that message hid the real reason. Now the real reason is reported.
+    if !out.status.success() {
+        bail!("SSIM comparison failed: {}", stderr.trim());
+    }
+
+    let all = match stderr.split("All:").nth(1) {
+        Some(s) => s,
+        None => bail!("no SSIM in ffmpeg output"),
+    };
+    let value = match all.split_whitespace().next() {
+        Some(v) => v,
+        None => bail!("bad SSIM output: {all:?}"),
+    };
+    match value.parse::<f64>() {
+        Ok(v) => Ok(v),
+        Err(e) => Err(anyhow::Error::from(e).context(format!("could not parse SSIM {value:?}"))),
+    }
 }
 
 fn read_wav(path: &Path) -> Result<(Vec<f32>, u32)> {
-    let reader =
-        WavReader::open(path).with_context(|| format!("could not open {}", path.display()))?;
+    let reader = match WavReader::open(path) {
+        Ok(r) => r,
+        Err(e) => {
+            return Err(anyhow::Error::from(e).context(format!("could not open {}", path.display())));
+        }
+    };
     let rate = reader.spec().sample_rate;
-    let samples: Vec<f32> = reader
-        .into_samples::<f32>()
-        .collect::<Result<Vec<f32>, _>>()?;
+    let samples: Vec<f32> = match reader.into_samples::<f32>().collect::<Result<Vec<f32>, _>>() {
+        Ok(s) => s,
+        Err(e) => {
+            return Err(anyhow::Error::from(e).context(format!("could not read samples from {}", path.display())));
+        }
+    };
     Ok((samples, rate))
 }
 
@@ -166,8 +240,11 @@ fn extract_verify_audio(out_path: &Path, wav_path: &Path) -> Result<()> {
         .arg(out_path)
         .args(["-vn", "-ac", "1", "-ar", "48000", "-c:a", "pcm_f32le"])
         .arg(wav_path)
-        .output()
-        .context("could not run ffmpeg")?;
+        .output();
+    let out = match out {
+        Ok(o) => o,
+        Err(e) => return Err(anyhow::Error::from(e).context("could not run ffmpeg to extract verify audio")),
+    };
 
     if !out.status.success() {
         bail!(
@@ -216,7 +293,9 @@ fn check_clicks(
     pre: Option<(&[f32], u32)>,
 ) -> Result<Check> {
     let (failures, worst, p999) = click_stats(samples, sample_rate, plan);
-    let n = plan.segments.len() - 1;
+    // saturating: with zero segments a plain `- 1` wraps round to a huge number
+    // in a release build, silently, instead of reading 0
+    let n = plan.segments.len().saturating_sub(1);
 
     let detail = match pre {
         Some((ps, pr)) => {
@@ -238,14 +317,27 @@ fn check_clicks(
 // ---------------------------------------------------------- duration vs plan
 
 fn check_duration(out_path: &Path, plan: &Plan) -> Result<Check> {
-    let json = ffprobe_json(out_path.to_str().context("non-UTF-8 path")?)?;
-    let probe: Probe =
-        serde_json::from_str(&json).context("could not parse ffprobe output for out.mp4")?;
-    let measured: f64 = probe
-        .format
-        .duration
-        .parse()
-        .with_context(|| format!("bad out.mp4 duration {:?}", probe.format.duration))?;
+    let path = match path_str(out_path) {
+        Ok(p) => p,
+        Err(e) => return Err(e),
+    };
+    let json = match ffprobe_json(path) {
+        Ok(j) => j,
+        Err(e) => return Err(e.context("could not probe the output")),
+    };
+    let probe: Probe = match serde_json::from_str(&json) {
+        Ok(p) => p,
+        Err(e) => {
+            return Err(anyhow::Error::from(e).context("could not parse ffprobe output for out.mp4"));
+        }
+    };
+    let measured: f64 = match probe.format.duration.parse() {
+        Ok(v) => v,
+        Err(e) => {
+            return Err(anyhow::Error::from(e)
+                .context(format!("bad out.mp4 duration {:?}", probe.format.duration)));
+        }
+    };
 
     let planned = plan.out_duration_s;
     let diff = measured - planned;
@@ -270,38 +362,65 @@ pub fn verify(
     let mut checks = Vec::new();
 
     // duration vs plan
-    checks.push(check_duration(out_path, plan)?);
+    match check_duration(out_path, plan) {
+        Ok(c) => checks.push(c),
+        Err(e) => return Err(e.context("duration check could not run")),
+    }
 
     // 5. faststart
-    checks.push(check_faststart(out_path)?);
+    match check_faststart(out_path) {
+        Ok(c) => checks.push(c),
+        Err(e) => return Err(e.context("faststart check could not run")),
+    }
 
     // 4. loudness
-    checks.push(check_loudness(out_path, target_lufs)?);
+    match check_loudness(out_path, target_lufs) {
+        Ok(c) => checks.push(c),
+        Err(e) => return Err(e.context("loudness check could not run")),
+    }
 
     // extract the delivered audio once — 1 and 2 both read it
     let verify_wav = temp_dir.join("verify.wav");
-    extract_verify_audio(out_path, &verify_wav)?;
-    let (samples, rate) = read_wav(&verify_wav)?;
+    match extract_verify_audio(out_path, &verify_wav) {
+        Ok(()) => {}
+        Err(e) => return Err(e.context("click check could not extract the output audio")),
+    }
+    let (samples, rate) = match read_wav(&verify_wav) {
+        Ok(v) => v,
+        Err(e) => return Err(e.context("click check could not read the output audio")),
+    };
 
     // 1. splice clicks — also measured on the pre-master concat, so the
     // limiter's smoothing of transients is visible rather than banked
     let concat_path = temp_dir.join("concat.mkv");
     let pre = if concat_path.exists() {
         let pre_wav = temp_dir.join("verify_pre.wav");
-        extract_verify_audio(&concat_path, &pre_wav)?;
-        Some(read_wav(&pre_wav)?)
+        match extract_verify_audio(&concat_path, &pre_wav) {
+            Ok(()) => {}
+            Err(e) => return Err(e.context("click check could not extract the pre-master audio")),
+        }
+        match read_wav(&pre_wav) {
+            Ok(v) => Some(v),
+            Err(e) => return Err(e.context("click check could not read the pre-master audio")),
+        }
     } else {
         None
     };
-    checks.push(check_clicks(
+    match check_clicks(
         &samples,
         rate,
         plan,
         pre.as_ref().map(|(s, r)| (s.as_slice(), *r)),
-    )?);
+    ) {
+        Ok(c) => checks.push(c),
+        Err(e) => return Err(e.context("click check could not run")),
+    }
 
     // 2. a/v sync
-    checks.push(check_sync(input, out_path, temp_dir, plan)?);
+    match check_sync(input, out_path, temp_dir, plan) {
+        Ok(c) => checks.push(c),
+        Err(e) => return Err(e.context("sync check could not run")),
+    }
 
     Ok(checks)
 }
